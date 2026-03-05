@@ -618,6 +618,7 @@ Address     HWtype  HWaddress         Flags
 ```
 
 **Check attacker is blocked:**
+
 ```bash
 # Try to ping from attacker — should fail now
 mininet> h3 ping 10.0.0.1 -c 3
@@ -859,3 +860,4 @@ EXPECTED RYU OUTPUT:
 
 *Document prepared for Minor Project: Detection of MITM Attacks with Flow Level Monitoring*  
 *Stack: Garuda Linux · Mininet · Ryu (Docker) · Python · CNN+LSTM*
+

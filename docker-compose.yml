@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  ryu-mitm:
+    build: .
+    container_name: ryu-mitm
+    network_mode: "host"  # Crucial for Mininet communication
+    volumes:
+      - .:/app
+    restart: unless-stopped
+    privileged: true      # Required for some network operations
+    tty: true
+    stdin_open: true
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: /bin/bash
