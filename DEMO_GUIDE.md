@@ -17,6 +17,7 @@ docker compose up -d --build
 Open **Terminal 1** and run:
 ```bash
 # Enter the container
+
 docker exec -it ryu-mitm /bin/bash
 
 # Inside container:
