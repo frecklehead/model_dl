@@ -85,19 +85,33 @@ class BankHandler(BaseHTTPRequestHandler):
         # Suppress default logging to keep terminal clean
         pass
 
+class BankServer(HTTPServer):
+    allow_reuse_address = True
+
 if __name__ == '__main__':
     # Clean previous log
     if os.path.exists(LOG_FILE):
-        os.remove(LOG_FILE)
+        try:
+            os.remove(LOG_FILE)
+        except OSError:
+            pass
         
-    print(f"Server started on port {SERVER_PORT}...")
-    log_event("Server started.")
+    log_event("Attempting to start server...")
     
-    # Enable address reuse so we can restart the server instantly
-    HTTPServer.allow_reuse_address = True
-    server = HTTPServer(('0.0.0.0', SERVER_PORT), BankHandler)
     try:
+        server = BankServer(('0.0.0.0', SERVER_PORT), BankHandler)
+        print(f"Server started on port {SERVER_PORT}...")
+        log_event("Server started successfully.")
         server.serve_forever()
+    except OSError as e:
+        if e.errno == 98:
+            print(f"❌ ERROR: Port {SERVER_PORT} is already in use.")
+            print("Try killing the existing process with: fuser -k 8080/tcp")
+            log_event(f"Error: Port {SERVER_PORT} in use.")
+        else:
+            print(f"❌ ERROR: {e}")
+            log_event(f"Error: {e}")
     except KeyboardInterrupt:
         print("\nServer stopping...")
-        server.server_close()
+        if 'server' in locals():
+            server.server_close()

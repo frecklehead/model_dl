@@ -16,11 +16,11 @@ RUN apt-get update && apt-get install -y \
 # Install specific setuptools version required for Ryu
 RUN pip install --no-cache-dir setuptools==58.0.0 wheel
 
+# Install Eventlet and dnspython for Python 3.10+ compatibility
+RUN pip install --no-cache-dir eventlet==0.35.2 dnspython==2.2.1
+
 # Install Ryu from source
 RUN pip install --no-cache-dir git+https://github.com/faucetsdn/ryu.git
-
-# Fix compatibility for Python 3.10+ (must be after ryu to avoid downgrade)
-RUN pip install --no-cache-dir eventlet==0.35.2 dnspython==2.2.1
 
 # Install ML and Networking libraries
 RUN pip install --no-cache-dir \
@@ -33,7 +33,7 @@ RUN pip install --no-cache-dir \
     requests \
     tabulate \
     colorama \
-    tensorflow-cpu
+    tensorflow-cpu  
 
 # Create working directory
 WORKDIR /app

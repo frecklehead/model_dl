@@ -202,9 +202,13 @@ class MITMController(app_manager.RyuApp):
             known_mac = self.arp_table[src_ip]
             if known_mac != src_mac:
                 # SPOOF DETECTED!
+                # For this demo, we use RULE-BASED to show immediate detection, 
+                # but NOT BLOCK yet so ML can also analyze the traffic later.
+                # If we want immediate blocking, uncomment line 208 below
                 self._trigger_detection(
                     "ARP SPOOFING", src_ip, src_mac, datapath, in_port,
-                    f"Claimed IP {src_ip} but MAC {src_mac} != {known_mac}"
+                    f"Claimed IP {src_ip} but MAC {src_mac} != {known_mac}",
+                    block=False # 🔥 Changed to False to let ML see the attack later
                 )
                 return 
 
@@ -358,7 +362,10 @@ class MITMController(app_manager.RyuApp):
             'protocol': key[2],
             'src_port': key[3],
             'dst_port': key[4],
-            'ps_variance_ratio': 0 # Approx
+            'ps_variance_ratio': 0, # Approx
+            'src2dst_duration_ms': duration, # Approx mapped to total
+            'dst2src_duration_ms': duration, # Approx mapped to total
+            'duration_ratio': 1.0
         }
         
         # If we have the exact feature list from the pickle, filter/order by it
@@ -385,32 +392,35 @@ class MITMController(app_manager.RyuApp):
         score = self.model.predict(vector, verbose=0)[0][0]
         
         ts = datetime.datetime.now().strftime('%H:%M:%S')
-        if score > 0.8: # Threshold
+        if score > 0.7: # 🔥 Threshold updated from 0.8 to 0.7 to match training
              print(f"[{ts}] [{MAGENTA}ML   {RESET}] Flow: {key[0]}→{key[1]} | pkts={total_pkts} | score={score:.4f} | {RED}MITM 🚨{RESET}")
-             self._trigger_detection("ML ANOMALY", src_ip, src_mac, datapath, 0, f"Score: {score:.4f}")
+             self._trigger_detection("ML ANOMALY", src_ip, src_mac, datapath, 0, f"Score: {score:.4f}", block=True)
         else:
              print(f"[{ts}] [{MAGENTA}ML   {RESET}] Flow: {key[0]}→{key[1]} | pkts={total_pkts} | score={score:.4f} | {GREEN}NORMAL ✅{RESET}")
 
-    def _trigger_detection(self, det_type, ip, mac, datapath, port, details):
+    def _trigger_detection(self, det_type, ip, mac, datapath, port, details, block=True):
         ts = datetime.datetime.now().strftime('%H:%M:%S')
         
         # Banner
-        print(f"\n{RED}╔══════════════════════════════════════════════╗{RESET}")
-        print(f"{RED}║  🚨 MITM ATTACK DETECTED — {det_type:<14}║{RESET}")
-        print(f"{RED}║  Time:      {ts:<33}║{RESET}")
-        print(f"{RED}║  Attacker:  {mac:<33}║{RESET}")
-        print(f"{RED}║  Claimed IP: {ip:<32}║{RESET}")
-        print(f"{RED}║  ACTION:    BLOCKING MAC ADDRESS             ║{RESET}")
-        print(f"{RED}╚══════════════════════════════════════════════╝{RESET}\n")
+        action_text = "BLOCKING MAC ADDRESS" if block else "DETECTION ONLY (ML WAITING)"
+        print(f"\n{RED if block else YELLOW}╔══════════════════════════════════════════════╗{RESET}")
+        print(f"{RED if block else YELLOW}║  🚨 MITM ATTACK DETECTED — {det_type:<14}║{RESET}")
+        print(f"{RED if block else YELLOW}║  Time:      {ts:<33}║{RESET}")
+        print(f"{RED if block else YELLOW}║  Attacker:  {mac:<33}║{RESET}")
+        print(f"{RED if block else YELLOW}║  Claimed IP: {ip:<32}║{RESET}")
+        print(f"{RED if block else YELLOW}║  ACTION:    {action_text:<33}║{RESET}")
+        print(f"{RED if block else YELLOW}╚══════════════════════════════════════════════╝{RESET}\n")
         
         self.detections.append(f"[{ts}] {det_type} -> MAC: {mac}")
-        self.blocked_hosts.add(mac) # Store MAC only
         
-        # Block MAC (This effectively stops the attacker)
-        # We use a high priority to ensure this rule hits first
-        parser = datapath.ofproto_parser
-        match = parser.OFPMatch(eth_src=mac)
-        self.add_flow(datapath, 100, match, []) # Drop
+        if block:
+            self.blocked_hosts.add(mac) # Store MAC only
+            
+            # Block MAC (This effectively stops the attacker)
+            # We use a high priority to ensure this rule hits first
+            parser = datapath.ofproto_parser
+            match = parser.OFPMatch(eth_src=mac)
+            self.add_flow(datapath, 100, match, []) # Drop
         
         # DO NOT block the 'ip' here, because 'ip' is the victim/server 
         # that the attacker is trying to impersonate!
