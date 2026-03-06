@@ -16,7 +16,7 @@ import os
 sys.stdout.reconfigure(line_buffering=True)
 
 # Configuration
-SERVER_IP = sys.argv[1] if len(sys.argv) > 1 else "10.0.0.2"
+SERVER_IP = "10.0.0.2"
 SERVER_PORT = 8080
 BASE_URL = f"http://{SERVER_IP}:{SERVER_PORT}"
 
@@ -28,7 +28,7 @@ SESSIONS = [
 
 def log(msg):
     ts = time.strftime('%H:%M:%S')
-    print(f"[VICTIM] [{ts}] {msg}")
+    print(f"[{ts}] {msg}")
 
 def run_user_session():
     session = requests.Session()
@@ -37,16 +37,16 @@ def run_user_session():
     
     try:
         # 1. Browse Homepage
-        log(f"Browsing homepage as {username}...")
+        log(f"Victim browsing homepage as {username}...")
         resp = session.get(f"{BASE_URL}/", timeout=2)
         if resp.status_code != 200:
             log(f"⚠️  Error reaching server: {resp.status_code}")
             return
 
-        time.sleep(random.uniform(0.5, 1.5))
+        time.sleep( random.uniform(0.5, 1.5))
 
         # 2. Login
-        log(f"Sending POST /login user={username}")
+        log(f"Sending POST /login user={username} pass={user_creds['pass']}")
         login_data = {'username': username, 'password': user_creds['pass']}
         resp = session.post(f"{BASE_URL}/login", data=login_data, timeout=2)
         
@@ -76,10 +76,8 @@ def run_user_session():
         log(f"❌ Error: {e}")
 
 if __name__ == "__main__":
-    print("==================================================")
-    print("👤 VICTIM CLIENT STARTED")
-    print(f"Target server: {SERVER_IP}")
-    print("==================================================")
+    print(f"Starting simulated victim traffic to {BASE_URL}...")
+    print("Press Ctrl+C to stop.")
     print("-" * 40)
     
     # Wait for server to be ready

