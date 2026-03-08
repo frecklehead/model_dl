@@ -9,6 +9,7 @@ import os
 import time
 import datetime
 import threading
+import csv
 import numpy as np
 from operator import attrgetter
 
@@ -46,9 +47,12 @@ class MITMController(app_manager.RyuApp):
         
         self.mac_to_port = {}
         self.arp_table = {}
-        self.flow_stats = {}
+        self.flow_stats = {} # Bidirectional flow stats from PacketIn
+        self.raw_flow_stats = {} # Raw OpenFlow stats from polling
+        self.datapaths = {}
         self.blocked_hosts = set() # Set of blocked (IP, MAC) tuples
         self.detections = [] # List of detection events for history
+        self.csv_file = "/tmp/flow_stats.csv"
         
         # Load Model
         self.model = None
@@ -88,6 +92,18 @@ class MITMController(app_manager.RyuApp):
                     self.features_list = joblib.load(features_path)
             except Exception as e:
                 print(f"{RED}❌ Error loading model: {e}{RESET}")
+
+    @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
+    def _state_change_handler(self, ev):
+        datapath = ev.datapath
+        if ev.state == MAIN_DISPATCHER:
+            if datapath.id not in self.datapaths:
+                print(f"{GREEN}[{datapath.id}] Switch Connected{RESET}")
+                self.datapaths[datapath.id] = datapath
+        elif ev.state == DEAD_DISPATCHER:
+            if datapath.id in self.datapaths:
+                print(f"{RED}[{datapath.id}] Switch Disconnected{RESET}")
+                del self.datapaths[datapath.id]
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -426,9 +442,92 @@ class MITMController(app_manager.RyuApp):
         # that the attacker is trying to impersonate!
 
     def _monitor(self):
+        count = 0
         while True:
-            hub.sleep(30)
-            self._print_stats()
+            # Poll every 5 seconds
+            for dp in self.datapaths.values():
+                self._request_stats(dp)
+            
+            hub.sleep(5)
+            count += 5
+            
+            # Print dashboard every 30 seconds
+            if count >= 30:
+                self._print_stats()
+                count = 0
+
+    def _request_stats(self, datapath):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        req = parser.OFPFlowStatsRequest(datapath)
+        datapath.send_msg(req)
+
+        req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
+        datapath.send_msg(req)
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def _flow_stats_reply_handler(self, ev):
+        body = ev.msg.body
+        dpid = ev.msg.datapath.id
+        ts = datetime.datetime.now().isoformat()
+        
+        # Open CSV for appending
+        file_exists = os.path.isfile(self.csv_file)
+        with open(self.csv_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                # Write Header
+                writer.writerow([
+                    'timestamp', 'dpid', 'eth_src', 'eth_dst', 
+                    'ipv4_src', 'ipv4_dst', 'ip_proto', 'src_port', 'dst_port',
+                    'duration_sec', 'duration_nsec', 'packet_count', 'byte_count',
+                    'packet_rate', 'byte_rate', 'label'
+                ])
+            
+            for stat in body:
+                # Extract fields
+                match = stat.match
+                eth_src = match.get('eth_src', '00:00:00:00:00:00')
+                eth_dst = match.get('eth_dst', '00:00:00:00:00:00')
+                ipv4_src = match.get('ipv4_src', '0.0.0.0')
+                ipv4_dst = match.get('ipv4_dst', '0.0.0.0')
+                ip_proto = match.get('ip_proto', 0)
+                src_port = match.get('tcp_src', match.get('udp_src', 0))
+                dst_port = match.get('tcp_dst', match.get('udp_dst', 0))
+                
+                duration = stat.duration_sec + stat.duration_nsec / 10**9
+                packet_rate = stat.packet_count / duration if duration > 0 else 0
+                byte_rate = stat.byte_count / duration if duration > 0 else 0
+                
+                # Label: 1 if src MAC is in blocked_hosts
+                label = 1 if eth_src in self.blocked_hosts else 0
+                
+                writer.writerow([
+                    ts, dpid, eth_src, eth_dst,
+                    ipv4_src, ipv4_dst, ip_proto, src_port, dst_port,
+                    stat.duration_sec, stat.duration_nsec, stat.packet_count, stat.byte_count,
+                    packet_rate, byte_rate, label
+                ])
+                
+                # Store raw data keyed by (dpid, match_tuple)
+                # match_tuple is just the match object's items
+                match_tuple = tuple(sorted(match.items()))
+                self.raw_flow_stats[(dpid, match_tuple)] = stat
+            
+        self.logger.info("Logged %d flows to %s", len(body), self.csv_file)
+
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def _port_stats_reply_handler(self, ev):
+        body = ev.msg.body
+        dpid = ev.msg.datapath.id
+        # We can store port stats if needed, or just log them
+        # For now, just keeping them in a dictionary as requested
+        for stat in body:
+            port_no = stat.port_no
+            # Use dpid and port_no as key
+            # (In a real app we'd use this for link utilization etc)
+            pass
 
     def _print_stats(self):
         ts = datetime.datetime.now().strftime('%H:%M:%S')
