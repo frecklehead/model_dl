@@ -24,9 +24,6 @@ ENV/
 
 # Model artifacts (large binaries — store with DVC or Git LFS if needed)
 
-model/*.pkl
-model/*.pb
-model/*.keras
 
 # Datasets (often large — add to Git LFS or keep out of repo)
 

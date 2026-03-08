@@ -12,6 +12,7 @@ import threading
 import csv
 import numpy as np
 from operator import attrgetter
+from flow_collector import FlowCSVWriter, SELECTED_FEATURES
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -53,6 +54,8 @@ class MITMController(app_manager.RyuApp):
         self.blocked_hosts = set() # Set of blocked (IP, MAC) tuples
         self.detections = [] # List of detection events for history
         self.csv_file = "/tmp/flow_stats.csv"
+        self.csv_file_raw = "/tmp/flow_stats_raw.csv"
+        self.csv_writer = FlowCSVWriter(self.csv_file)
         
         # Load Model
         self.model = None
@@ -98,7 +101,7 @@ class MITMController(app_manager.RyuApp):
         datapath = ev.datapath
         if ev.state == MAIN_DISPATCHER:
             if datapath.id not in self.datapaths:
-                print(f"{GREEN}[{datapath.id}] Switch Connected{RESET}")
+                print(f"{GREEN}[{datapath.id}] Switch Connected (Registering for stats){RESET}")
                 self.datapaths[datapath.id] = datapath
         elif ev.state == DEAD_DISPATCHER:
             if datapath.id in self.datapaths:
@@ -116,6 +119,10 @@ class MITMController(app_manager.RyuApp):
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                           ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
+        
+        # Ensure it's in datapaths (if state_change didn't fire yet)
+        if datapath.id not in self.datapaths:
+            self.datapaths[datapath.id] = datapath
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
@@ -271,12 +278,48 @@ class MITMController(app_manager.RyuApp):
         # Log HTTP, ICMP, and 20% of other packets to show activity
         if log_type in ["HTTP ", "ICMP "] or np.random.rand() < 0.2:
             print(f"[{ts}] [{BLUE}{log_type}{RESET}] {info} | sw={datapath.id} port={in_port} | len={pkt_ipv4.total_length}")
-        # UPDATE FLOW STATS for ML
-        self._update_flow_stats(
-            src_ip, dst_ip, src_mac, dst_mac, 
-            protocol, l4_src, l4_dst, 
-            pkt_ipv4.total_length, pkt_tcp, datapath
-        )
+        
+        # UPDATE FLOW STATS for CSV & ML
+        flow = self.csv_writer.add_packet(src_ip, dst_ip, l4_src, l4_dst, protocol, pkt_ipv4.total_length)
+        
+        if flow.bi_packets % 20 == 0:
+            self._run_ml_check_v2(flow, src_mac, datapath)
+
+    def _run_ml_check_v2(self, flow, src_mac, datapath):
+        if not self.model:
+            return
+        
+        # EXTRACT FEATURES matching selected_features.pkl
+        row = flow.to_dict(label=0)
+        
+        # Build vector in exact order
+        try:
+            vector = np.array([[row.get(feat, 0) for feat in self.features_list]])
+        except:
+            # Fallback if features_list is missing
+            return
+
+        # Scale
+        if self.scaler:
+            vector = self.scaler.transform(vector)
+
+        # Reshape for CNN (Samples, Features, 1)
+        vector = vector.reshape(1, vector.shape[1], 1)
+        
+        # Predict
+        score = self.model.predict(vector, verbose=0)[0][0]
+        
+        ts = datetime.datetime.now().strftime('%H:%M:%S')
+        key_str = f"{flow.src_ip}↔{flow.dst_ip}"
+        
+        if score > 0.7:
+             print(f"[{ts}] [{MAGENTA}ML   {RESET}] Flow: {key_str} | pkts={flow.bi_packets} | score={score:.4f} | {RED}MITM 🚨{RESET}")
+             self._trigger_detection("ML ANOMALY", flow.src_ip, src_mac, datapath, 0, f"Score: {score:.4f}", block=True)
+             # Write to CSV as attack
+             key = self.csv_writer._get_key(flow.src_ip, flow.dst_ip, flow.src_port, flow.dst_port, flow.protocol)
+             self.csv_writer.write_flow(key, label=1)
+        else:
+             print(f"[{ts}] [{MAGENTA}ML   {RESET}] Flow: {key_str} | pkts={flow.bi_packets} | score={score:.4f} | {GREEN}NORMAL ✅{RESET}")
 
     def _update_flow_stats(self, src_ip, dst_ip, src_mac, dst_mac, proto, l4_src, l4_dst, length, tcp_seg, datapath):
         # Key: tuple sorted to represent bidirectional flow
@@ -442,9 +485,15 @@ class MITMController(app_manager.RyuApp):
         # that the attacker is trying to impersonate!
 
     def _monitor(self):
+        print(f"{BLUE}--- Polling Thread Started ---{RESET}")
         count = 0
         while True:
             # Poll every 5 seconds
+            if not self.datapaths:
+                # No switches yet, wait
+                hub.sleep(1)
+                continue
+                
             for dp in self.datapaths.values():
                 self._request_stats(dp)
             
@@ -459,7 +508,8 @@ class MITMController(app_manager.RyuApp):
     def _request_stats(self, datapath):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
+        
+        # DEBUG: print(f"Sending stats request to datapath {datapath.id}")
         req = parser.OFPFlowStatsRequest(datapath)
         datapath.send_msg(req)
 
@@ -472,19 +522,25 @@ class MITMController(app_manager.RyuApp):
         dpid = ev.msg.datapath.id
         ts = datetime.datetime.now().isoformat()
         
+        # DEBUG print
+        # print(f"Received flow stats reply from {dpid} with {len(body)} entries")
+
         # Open CSV for appending
-        file_exists = os.path.isfile(self.csv_file)
-        with open(self.csv_file, 'a', newline='') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                # Write Header
+        file_exists = os.path.isfile(self.csv_file_raw)
+        
+        # Write header if new file
+        if not file_exists:
+            with open(self.csv_file_raw, 'w', newline='') as f:
+                writer = csv.writer(f)
                 writer.writerow([
                     'timestamp', 'dpid', 'eth_src', 'eth_dst', 
                     'ipv4_src', 'ipv4_dst', 'ip_proto', 'src_port', 'dst_port',
                     'duration_sec', 'duration_nsec', 'packet_count', 'byte_count',
                     'packet_rate', 'byte_rate', 'label'
                 ])
-            
+        
+        with open(self.csv_file_raw, 'a', newline='') as f:
+            writer = csv.writer(f)
             for stat in body:
                 # Extract fields
                 match = stat.match
@@ -515,7 +571,7 @@ class MITMController(app_manager.RyuApp):
                 match_tuple = tuple(sorted(match.items()))
                 self.raw_flow_stats[(dpid, match_tuple)] = stat
             
-        self.logger.info("Logged %d flows to %s", len(body), self.csv_file)
+        self.logger.info("Logged %d flows to %s", len(body), self.csv_file_raw)
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def _port_stats_reply_handler(self, ev):
