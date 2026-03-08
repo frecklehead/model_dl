@@ -4,13 +4,16 @@ services:
   ryu-mitm:
     build: .
     container_name: ryu-mitm
-    network_mode: "host"  # Crucial for Mininet communication
+    network_mode: "host"
     volumes:
       - .:/app
     restart: unless-stopped
-    privileged: true      # Required for some network operations
-    tty: true
-    stdin_open: true
+    privileged: true
     environment:
       - PYTHONUNBUFFERED=1
-    command: /bin/bash
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "6633"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    command: ryu-manager my_controller.py

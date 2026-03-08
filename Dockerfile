@@ -16,10 +16,10 @@ RUN apt-get update && apt-get install -y \
 # Install specific setuptools version required for Ryu
 RUN pip install --no-cache-dir setuptools==58.0.0 wheel
 
-# Install Eventlet and dnspython for Python 3.10+ compatibility
-RUN pip install --no-cache-dir eventlet==0.35.2 dnspython==2.2.1
+# Install older Eventlet for better compatibility
+RUN pip install --no-cache-dir eventlet==0.33.3
 
-# Install Ryu from source
+# Install Ryu from official git
 RUN pip install --no-cache-dir git+https://github.com/faucetsdn/ryu.git
 
 # Install ML and Networking libraries
@@ -27,13 +27,13 @@ RUN pip install --no-cache-dir \
     numpy \
     pandas \
     joblib \
+    tensorflow \
     scikit-learn \
     imbalanced-learn \
     scapy \
     requests \
     tabulate \
-    colorama \
-    tensorflow-cpu  
+    colorama
 
 # Create working directory
 WORKDIR /app
@@ -44,5 +44,5 @@ RUN mkdir -p model plots scripts
 # Expose OpenFlow and HTTP ports
 EXPOSE 6633 8080
 
-# Default command (can be overridden)
-CMD ["/bin/bash"]
+# Default command
+CMD ["ryu-manager", "my_controller.py"]

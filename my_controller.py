@@ -1,111 +1,185 @@
 # -*- coding: utf-8 -*-
 """
 my_controller.py
-MITM Detection Ryu Controller with Live Dashboard
+Clean SDN Controller for MITM Detection with Live Dashboard
 """
 
-import sys
 import os
 import time
 import datetime
 import threading
-import csv
 import numpy as np
-from operator import attrgetter
-from flow_collector import FlowCSVWriter, SELECTED_FEATURES
+import joblib
+from tabulate import tabulate
+from colorama import Fore, Style, init
 
+# Ryu imports
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet, arp, ipv4, tcp, udp, icmp, ether_types
+from ryu.lib.packet import packet, ethernet, arp, ipv4, tcp, udp, ether_types
 from ryu.lib import hub
 
-# Terminal Colors
-RED = '\033[91m'
-GREEN = '\033[92m'
-YELLOW = '\033[93m'
-BLUE = '\033[94m'
-MAGENTA = '\033[95m'
-CYAN = '\033[96m'
-RESET = '\033[0m'
-BOLD = '\033[1m'
+# Initialize colorama
+init(autoreset=True)
 
 # ML Libraries
 try:
-    import joblib
     import tensorflow as tf
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
+
+# Features requested by user (25 features)
+FEATURES = [
+    'bidirectional_duration_ms', 'bidirectional_packets', 'bidirectional_bytes',
+    'src2dst_packets', 'src2dst_bytes', 'dst2src_packets', 'dst2src_bytes',
+    'bidirectional_mean_ps', 'bidirectional_stddev_ps', 'bidirectional_mean_piat_ms',
+    'bidirectional_stddev_piat_ms', 'bidirectional_syn_packets', 'bidirectional_ack_packets',
+    'bidirectional_rst_packets', 'bidirectional_fin_packets', 'packet_asymmetry',
+    'byte_asymmetry', 'bytes_per_packet', 'syn_ratio', 'rst_ratio',
+    'piat_variance_ratio', 'protocol', 'src_port', 'dst_port', 'ps_variance_ratio'
+]
+
+class FlowTracker:
+    def __init__(self, src_ip, dst_ip, src_port, dst_port, protocol):
+        self.src_ip = src_ip
+        self.dst_ip = dst_ip
+        self.src_port = src_port
+        self.dst_port = dst_port
+        self.protocol = protocol
+        
+        self.start_time = time.time()
+        self.last_time = time.time()
+        
+        self.s2d_packets = 0
+        self.s2d_bytes = 0
+        self.d2s_packets = 0
+        self.d2s_bytes = 0
+        
+        self.packet_sizes = []
+        self.piats = []
+        
+        self.syn_count = 0
+        self.ack_count = 0
+        self.rst_count = 0
+        self.fin_count = 0
+        
+        self.last_score = 0.0
+        self.is_mitm = False
+
+    def update(self, size, direction, flags=0):
+        now = time.time()
+        self.piats.append((now - self.last_time) * 1000)
+        self.last_time = now
+        self.packet_sizes.append(size)
+        
+        if direction == 's2d':
+            self.s2d_packets += 1
+            self.s2d_bytes += size
+        else:
+            self.d2s_packets += 1
+            self.d2s_bytes += size
+            
+        # Ryu TCP flags: FIN=1, SYN=2, RST=4, PSH=8, ACK=16
+        if flags & 0x02: self.syn_count += 1
+        if flags & 0x10: self.ack_count += 1
+        if flags & 0x04: self.rst_count += 1
+        if flags & 0x01: self.fin_count += 1
+
+    def get_features(self):
+        duration = (self.last_time - self.start_time) * 1000
+        total_pkts = self.s2d_packets + self.d2s_packets
+        total_bytes = self.s2d_bytes + self.d2s_bytes
+        
+        mean_ps = np.mean(self.packet_sizes) if self.packet_sizes else 0
+        std_ps = np.std(self.packet_sizes) if self.packet_sizes else 0
+        mean_piat = np.mean(self.piats) if self.piats else 0
+        std_piat = np.std(self.piats) if self.piats else 0
+        
+        safe_pkts = total_pkts if total_pkts > 0 else 1
+        
+        return {
+            'bidirectional_duration_ms': duration,
+            'bidirectional_packets': total_pkts,
+            'bidirectional_bytes': total_bytes,
+            'src2dst_packets': self.s2d_packets,
+            'src2dst_bytes': self.s2d_bytes,
+            'dst2src_packets': self.d2s_packets,
+            'dst2src_bytes': self.d2s_bytes,
+            'bidirectional_mean_ps': mean_ps,
+            'bidirectional_stddev_ps': std_ps,
+            'bidirectional_mean_piat_ms': mean_piat,
+            'bidirectional_stddev_piat_ms': std_piat,
+            'bidirectional_syn_packets': self.syn_count,
+            'bidirectional_ack_packets': self.ack_count,
+            'bidirectional_rst_packets': self.rst_count,
+            'bidirectional_fin_packets': self.fin_count,
+            'packet_asymmetry': abs(self.s2d_packets - self.d2s_packets) / safe_pkts,
+            'byte_asymmetry': abs(self.s2d_bytes - self.d2s_bytes) / (total_bytes + 1),
+            'bytes_per_packet': total_bytes / safe_pkts,
+            'syn_ratio': self.syn_count / safe_pkts,
+            'rst_ratio': self.rst_count / safe_pkts,
+            'piat_variance_ratio': (std_piat**2) / (mean_piat + 1),
+            'protocol': self.protocol,
+            'src_port': self.src_port,
+            'dst_port': self.dst_port,
+            'ps_variance_ratio': (std_ps**2) / (mean_ps + 1)
+        }
 
 class MITMController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
         super(MITMController, self).__init__(*args, **kwargs)
-        
         self.mac_to_port = {}
-        self.arp_table = {}
-        self.flow_stats = {} # Bidirectional flow stats from PacketIn
-        self.raw_flow_stats = {} # Raw OpenFlow stats from polling
+        self.arp_table = {}  # IP -> MAC
+        self.flows = {}      # (ip1, ip2, port1, port2, proto) -> FlowTracker
         self.datapaths = {}
-        self.blocked_hosts = set() # Set of blocked (IP, MAC) tuples
-        self.detections = [] # List of detection events for history
-        self.csv_file = "/tmp/flow_stats.csv"
-        self.csv_file_raw = "/tmp/flow_stats_raw.csv"
-        self.csv_writer = FlowCSVWriter(self.csv_file)
+        self.blocked_macs = set()
+        self.blocked_ips = set()
+        self.detections = []
         
         # Load Model
         self.model = None
         self.scaler = None
-        self.features_list = None
         self._load_model()
         
-        # Start Dashboard Thread
-        self.monitor_thread = hub.spawn(self._monitor)
-        
+        # Print Header
         self._print_header()
-
-    def _print_header(self):
-        print(f"{BOLD}{CYAN}╔══════════════════════════════════════╗{RESET}")
-        print(f"{BOLD}{CYAN}║   MITM DETECTION CONTROLLER v1.0    ║{RESET}")
-        print(f"{BOLD}{CYAN}║   Layer 1: ARP Rule-based           ║{RESET}")
-        print(f"{BOLD}{CYAN}║   Layer 2: CNN+LSTM ML Model        ║{RESET}")
-        print(f"{BOLD}{CYAN}╚══════════════════════════════════════╝{RESET}")
-        if ML_AVAILABLE and self.model:
-            print(f"{GREEN}✅ ML Model Loaded Successfully{RESET}")
-        else:
-            print(f"{YELLOW}⚠️  ML Model NOT Loaded (Rule-based only){RESET}")
+        
+        # Start Stats Timer
+        self.stats_thread = hub.spawn(self._stats_timer)
 
     def _load_model(self):
-        if not ML_AVAILABLE:
-            return
-
-        model_path = "model/mitm_model.h5"
-        scaler_path = "model/scaler.pkl"
-        features_path = "model/selected_features.pkl"
-        
-        if os.path.exists(model_path) and os.path.exists(scaler_path):
+        m_path = "/app/model/mitm_model.h5"
+        s_path = "/app/model/scaler.pkl"
+        if ML_AVAILABLE and os.path.exists(m_path):
             try:
-                self.model = tf.keras.models.load_model(model_path)
-                self.scaler = joblib.load(scaler_path)
-                if os.path.exists(features_path):
-                    self.features_list = joblib.load(features_path)
+                self.model = tf.keras.models.load_model(m_path)
+                if os.path.exists(s_path):
+                    self.scaler = joblib.load(s_path)
+                self.logger.info("CNN+LSTM Model loaded successfully.")
             except Exception as e:
-                print(f"{RED}❌ Error loading model: {e}{RESET}")
+                self.logger.error(f"Error loading model: {e}")
+
+    def _print_header(self):
+        print(Fore.CYAN + Style.BRIGHT + "╔══════════════════════════════════════╗")
+        print(Fore.CYAN + Style.BRIGHT + "║   MITM DETECTION CONTROLLER v1.0    ║")
+        print(Fore.CYAN + Style.BRIGHT + "║   Layer 1: ARP Rule-based           ║")
+        print(Fore.CYAN + Style.BRIGHT + "║   Layer 2: CNN+LSTM ML Model        ║")
+        print(Fore.CYAN + Style.BRIGHT + "╚══════════════════════════════════════╝")
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
         datapath = ev.datapath
         if ev.state == MAIN_DISPATCHER:
             if datapath.id not in self.datapaths:
-                print(f"{GREEN}[{datapath.id}] Switch Connected (Registering for stats){RESET}")
                 self.datapaths[datapath.id] = datapath
         elif ev.state == DEAD_DISPATCHER:
             if datapath.id in self.datapaths:
-                print(f"{RED}[{datapath.id}] Switch Disconnected{RESET}")
                 del self.datapaths[datapath.id]
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -113,27 +187,17 @@ class MITMController(app_manager.RyuApp):
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
-        # Install table-miss flow entry
         match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                          ofproto.OFPCML_NO_BUFFER)]
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
-        
-        # Ensure it's in datapaths (if state_change didn't fire yet)
-        if datapath.id not in self.datapaths:
-            self.datapaths[datapath.id] = datapath
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
-                                             actions)]
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         if buffer_id:
             mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
-                                    priority=priority, match=match,
-                                    instructions=inst)
+                                    priority=priority, match=match, instructions=inst)
         else:
             mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
                                     match=match, instructions=inst)
@@ -149,461 +213,186 @@ class MITMController(app_manager.RyuApp):
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
-        
-        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
-            return
+        if not eth or eth.ethertype == ether_types.ETH_TYPE_LLDP: return
 
-        dst = eth.dst
-        src = eth.src
-        dpid = datapath.id
-
-        self.mac_to_port.setdefault(dpid, {})
-        self.mac_to_port[dpid][src] = in_port
-
-        # 1. LOGGING & DETECTION
         ts = datetime.datetime.now().strftime('%H:%M:%S')
+        src_mac = eth.src
+        dst_mac = eth.dst
         
-        # Check if source MAC is blocked
-        if src in self.blocked_hosts:
-            # Drop silently
-            return
+        # Blocked check
+        if src_mac in self.blocked_macs: return
 
-        # Handle ARP
+        # ARP handling
         pkt_arp = pkt.get_protocol(arp.arp)
         if pkt_arp:
-            self._handle_arp(datapath, in_port, pkt_arp, src, dst, ts)
+            self._handle_arp(datapath, in_port, pkt_arp, eth, ts)
 
-        # Handle IP/TCP/UDP & ML
+        # IP handling
         pkt_ipv4 = pkt.get_protocol(ipv4.ipv4)
         if pkt_ipv4:
-            self._handle_ipv4(datapath, in_port, pkt, pkt_ipv4, src, dst, ts)
+            if pkt_ipv4.src in self.blocked_ips: return
+            self._handle_ipv4(datapath, in_port, pkt, pkt_ipv4, eth, ts)
 
-        # 2. FORWARDING LOGIC
-        if dst in self.mac_to_port[dpid]:
-            out_port = self.mac_to_port[dpid][dst]
+        # Learning & Forwarding
+        self.mac_to_port.setdefault(datapath.id, {})
+        self.mac_to_port[datapath.id][src_mac] = in_port
+        
+        if dst_mac in self.mac_to_port[datapath.id]:
+            out_port = self.mac_to_port[datapath.id][dst_mac]
         else:
             out_port = ofproto.OFPP_FLOOD
 
         actions = [parser.OFPActionOutput(out_port)]
-
-        # Install a flow to avoid PacketIn next time (unless we want to monitor stats)
-        # Note: For this project, we might want to keep sending to controller to collect stats 
-        # OR use OpenFlow stats requests. 
-        # To keep it simple and responsive for the demo, we will install flows but rely on 
-        # stats polling or just sample PacketIns. 
-        # Actually, for the ML features requested (stats), we should rely on the packet_in 
-        # loop for calculation IF the volume isn't massive, OR use the monitor thread 
-        # to query stats.
-        # Given "Flow Level Monitoring", let's aggregate here for simplicity on small Mininet networks.
-        
-        if out_port != ofproto.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
-            # Verify if flow already exists? No, just add/overwrite.
-            if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-                self.add_flow(datapath, 1, match, actions, msg.buffer_id)
-                return
-            else:
-                self.add_flow(datapath, 1, match, actions)
+        # We don't install permanent flows so we can keep monitoring packet_ins for stats
+        # but to keep it realistic we could install flows with low idle_timeout.
+        # For this demo, we use PacketIn for all traffic to ensure ML gets every packet.
         
         data = None
-        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-            data = msg.data
-
+        if msg.buffer_id == ofproto.OFP_NO_BUFFER: data = msg.data
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
                                   in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
 
-    def _handle_arp(self, datapath, in_port, pkt_arp, src_mac, dst_mac, ts):
-        op = "REQUEST" if pkt_arp.opcode == arp.ARP_REQUEST else "REPLY"
-        src_ip = pkt_arp.src_ip
-        dst_ip = pkt_arp.dst_ip
+    def _handle_arp(self, datapath, in_port, pkt_arp, eth, ts):
+        opcode = "REQUEST" if pkt_arp.opcode == arp.ARP_REQUEST else "REPLY"
+        print(f"[{ts}] [{Fore.YELLOW}ARP  {Style.RESET_ALL}] {opcode:<8} {pkt_arp.src_ip} ({eth.src}) → {pkt_arp.dst_ip}")
+        
+        # Layer 1 Detection (ARP Spoofing)
+        if pkt_arp.src_ip in self.arp_table:
+            if self.arp_table[pkt_arp.src_ip] != eth.src:
+                self._trigger_detection("ARP SPOOF", pkt_arp.src_ip, eth.src, datapath, in_port, "Impersonating known IP")
+        else:
+            self.arp_table[pkt_arp.src_ip] = eth.src
 
-        print(f"[{ts}] [{YELLOW}ARP  {RESET}] {op:<7} {src_ip} ({src_mac}) → {dst_ip}")
-
-        # ARP Spoofing Detection (Rule-based)
-        if src_ip in self.arp_table:
-            known_mac = self.arp_table[src_ip]
-            if known_mac != src_mac:
-                # SPOOF DETECTED!
-                # For this demo, we use RULE-BASED to show immediate detection, 
-                # but NOT BLOCK yet so ML can also analyze the traffic later.
-                # If we want immediate blocking, uncomment line 208 below
-                self._trigger_detection(
-                    "ARP SPOOFING", src_ip, src_mac, datapath, in_port,
-                    f"Claimed IP {src_ip} but MAC {src_mac} != {known_mac}",
-                    block=False # 🔥 Changed to False to let ML see the attack later
-                )
-                return 
-
-        self.arp_table[src_ip] = src_mac
-
-    def _handle_ipv4(self, datapath, in_port, pkt, pkt_ipv4, src_mac, dst_mac, ts):
+    def _handle_ipv4(self, datapath, in_port, pkt, pkt_ipv4, eth, ts):
         src_ip = pkt_ipv4.src
         dst_ip = pkt_ipv4.dst
+        proto = pkt_ipv4.proto
         
-        # Parse Protocol
-        protocol = pkt_ipv4.proto
         pkt_tcp = pkt.get_protocol(tcp.tcp)
         pkt_udp = pkt.get_protocol(udp.udp)
-        pkt_icmp = pkt.get_protocol(icmp.icmp)
-
-        log_type = "IP   "
+        
+        src_port, dst_port, flags = 0, 0, 0
+        type_str = "IP   "
         info = ""
 
-        l4_src = 0
-        l4_dst = 0
-
         if pkt_tcp:
-            log_type = "TCP  "
-            l4_src = pkt_tcp.src_port
-            l4_dst = pkt_tcp.dst_port
-
-            # Identify HTTP
-            if l4_dst == 8080 or l4_src == 8080 or l4_dst == 80 or l4_src == 80:
-                log_type = "HTTP "
-
-            info = f"{src_ip}:{l4_src} → {dst_ip}:{l4_dst}"
+            src_port, dst_port = pkt_tcp.src_port, pkt_tcp.dst_port
+            flags = pkt_tcp.bits
+            type_str = "TCP  "
+            if dst_port == 8080 or src_port == 8080:
+                type_str = "HTTP "
+                # Very basic HTTP detection from payload if possible
+                payload = str(pkt.protocols[-1])
+                if "GET" in payload: info = "| GET /"
+                elif "POST" in payload: info = "| POST /login " + (Fore.RED + "⚠️" if "password" in payload.lower() else "")
+            
+            log_msg = f"[{ts}] [{Fore.BLUE}{type_str}{Style.RESET_ALL}] {src_ip}:{src_port} → {dst_ip}:{dst_port} {info}"
         elif pkt_udp:
-            log_type = "UDP  "
-            l4_src = pkt_udp.src_port
-            l4_dst = pkt_udp.dst_port
-            info = f"{src_ip}:{l4_src} → {dst_ip}:{l4_dst}"
-        elif pkt_icmp:
-            log_type = "ICMP "
-            info = f"{src_ip} → {dst_ip}"
+            src_port, dst_port = pkt_udp.src_port, pkt_udp.dst_port
+            type_str = "UDP  "
+            log_msg = f"[{ts}] [{Fore.BLUE}{type_str}{Style.RESET_ALL}] {src_ip}:{src_port} → {dst_ip}:{dst_port}"
         else:
-            info = f"{src_ip} → {dst_ip}"
+            log_msg = f"[{ts}] [{Fore.BLUE}{type_str}{Style.RESET_ALL}] {src_ip} → {dst_ip} | pkts=1 bytes={pkt_ipv4.total_length}"
 
-        # Compact Log
-        # Log HTTP, ICMP, and 20% of other packets to show activity
-        if log_type in ["HTTP ", "ICMP "] or np.random.rand() < 0.2:
-            print(f"[{ts}] [{BLUE}{log_type}{RESET}] {info} | sw={datapath.id} port={in_port} | len={pkt_ipv4.total_length}")
-        
-        # UPDATE FLOW STATS for CSV & ML
-        flow = self.csv_writer.add_packet(src_ip, dst_ip, l4_src, l4_dst, protocol, pkt_ipv4.total_length)
-        
-        if flow.bi_packets % 20 == 0:
-            self._run_ml_check_v2(flow, src_mac, datapath)
+        print(log_msg)
 
-    def _run_ml_check_v2(self, flow, src_mac, datapath):
-        if not self.model:
-            return
+        # Track Flow
+        key = tuple(sorted([(src_ip, src_port), (dst_ip, dst_port)])) + (proto,)
+        if key not in self.flows:
+            self.flows[key] = FlowTracker(src_ip, dst_ip, src_port, dst_port, proto)
         
-        # EXTRACT FEATURES matching selected_features.pkl
-        row = flow.to_dict(label=0)
+        dir = 's2d' if (src_ip, src_port) == key[0] else 'd2s'
+        self.flows[key].update(pkt_ipv4.total_length, dir, flags)
         
-        # Build vector in exact order
-        try:
-            vector = np.array([[row.get(feat, 0) for feat in self.features_list]])
-        except:
-            # Fallback if features_list is missing
-            return
+        # ML Analysis every 20 packets
+        total_p = self.flows[key].s2d_packets + self.flows[key].d2s_packets
+        if total_p % 20 == 0:
+            self._run_ml(key, ts, datapath, eth.src)
 
-        # Scale
-        if self.scaler:
-            vector = self.scaler.transform(vector)
-
-        # Reshape for CNN (Samples, Features, 1)
+    def _run_ml(self, key, ts, datapath, src_mac):
+        if not self.model: return
+        flow = self.flows[key]
+        feat_dict = flow.get_features()
+        
+        # Build vector
+        vector = np.array([[feat_dict[f] for f in FEATURES]])
+        if self.scaler: vector = self.scaler.transform(vector)
+        
+        # Reshape for CNN (TimeSteps=1 for live)
         vector = vector.reshape(1, vector.shape[1], 1)
         
-        # Predict
         score = self.model.predict(vector, verbose=0)[0][0]
+        flow.last_score = score
         
-        ts = datetime.datetime.now().strftime('%H:%M:%S')
-        key_str = f"{flow.src_ip}↔{flow.dst_ip}"
+        status = f"{Fore.RED}MITM 🚨" if score > 0.5 else f"{Fore.GREEN}NORMAL ✅"
+        print(f"[{ts}] [{Fore.MAGENTA}ML   {Style.RESET_ALL}] Flow: {flow.src_ip}→{flow.dst_ip} | pkts={flow.s2d_packets+flow.d2s_packets} | score={score:.4f} | {status}")
         
-        if score > 0.7:
-             print(f"[{ts}] [{MAGENTA}ML   {RESET}] Flow: {key_str} | pkts={flow.bi_packets} | score={score:.4f} | {RED}MITM 🚨{RESET}")
-             self._trigger_detection("ML ANOMALY", flow.src_ip, src_mac, datapath, 0, f"Score: {score:.4f}", block=True)
-             # Write to CSV as attack
-             key = self.csv_writer._get_key(flow.src_ip, flow.dst_ip, flow.src_port, flow.dst_port, flow.protocol)
-             self.csv_writer.write_flow(key, label=1)
-        else:
-             print(f"[{ts}] [{MAGENTA}ML   {RESET}] Flow: {key_str} | pkts={flow.bi_packets} | score={score:.4f} | {GREEN}NORMAL ✅{RESET}")
+        if score > 0.8:
+            flow.is_mitm = True
+            self._trigger_detection("ML DETECT", flow.src_ip, src_mac, datapath, 0, f"Score: {score:.4f}")
 
-    def _update_flow_stats(self, src_ip, dst_ip, src_mac, dst_mac, proto, l4_src, l4_dst, length, tcp_seg, datapath):
-        # Key: tuple sorted to represent bidirectional flow
-        if src_ip < dst_ip:
-            key = (src_ip, dst_ip, proto, l4_src, l4_dst)
-            forward = True
-        else:
-            key = (dst_ip, src_ip, proto, l4_dst, l4_src)
-            forward = False
-        
-        now = time.time()
-        
-        if key not in self.flow_stats:
-            self.flow_stats[key] = {
-                'start_time': now,
-                'last_time': now,
-                'pkts_fwd': 0, 'bytes_fwd': 0,
-                'pkts_bwd': 0, 'bytes_bwd': 0,
-                'syn': 0, 'ack': 0, 'rst': 0, 'fin': 0,
-                'piats': [] 
-            }
-        
-        f = self.flow_stats[key]
-        
-        # PIAT
-        piat = (now - f['last_time']) * 1000
-        f['piats'].append(piat)
-        f['last_time'] = now
-        
-        # Counts
-        if forward:
-            f['pkts_fwd'] += 1
-            f['bytes_fwd'] += length
-        else:
-            f['pkts_bwd'] += 1
-            f['bytes_bwd'] += length
-            
-        # TCP Flags
-        if tcp_seg:
-            # scapy/ryu flags logic might differ. Ryu uses integer.
-            # FIN=0x01, SYN=0x02, RST=0x04, PSH=0x08, ACK=0x10
-            flg = tcp_seg.bits
-            if flg & 0x02: f['syn'] += 1
-            if flg & 0x10: f['ack'] += 1
-            if flg & 0x04: f['rst'] += 1
-            if flg & 0x01: f['fin'] += 1
-
-        # Trigger ML every 20 packets total
-        total_pkts = f['pkts_fwd'] + f['pkts_bwd']
-        if total_pkts > 0 and total_pkts % 20 == 0:
-            self._run_ml_check(key, f, src_ip, src_mac, datapath)
-
-    def _run_ml_check(self, key, f, src_ip, src_mac, datapath):
-        if not self.model:
-            return
-
-        # EXTRACT FEATURES
-        # Matches logic in Task 2 - I
-        total_pkts = f['pkts_fwd'] + f['pkts_bwd']
-        total_bytes = f['bytes_fwd'] + f['bytes_bwd']
-        duration = (f['last_time'] - f['start_time']) * 1000
-        
-        # Avoid div by zero
-        safe_pkts = total_pkts if total_pkts > 0 else 1
-        
-        mean_ps = total_bytes / safe_pkts
-        # Simple approximation for stddev without storing all packet sizes
-        std_ps = 0 # In a real system, we'd track variance online. 
-        
-        mean_piat = np.mean(f['piats']) if f['piats'] else 0
-        std_piat = np.std(f['piats']) if f['piats'] else 0
-        
-        # Build Vector
-        # Ensure this order matches your training columns EXACTLY
-        # For this demo, we assume the list provided in the prompt is the target order
-        
-        features = {
-            'bidirectional_duration_ms': duration,
-            'bidirectional_packets': total_pkts,
-            'bidirectional_bytes': total_bytes,
-            'src2dst_packets': f['pkts_fwd'],
-            'src2dst_bytes': f['bytes_fwd'],
-            'dst2src_packets': f['pkts_bwd'],
-            'dst2src_bytes': f['bytes_bwd'],
-            'bidirectional_mean_ps': mean_ps,
-            'bidirectional_stddev_ps': std_ps, # Approx
-            'bidirectional_mean_piat_ms': mean_piat,
-            'bidirectional_stddev_piat_ms': std_piat,
-            'bidirectional_syn_packets': f['syn'],
-            'bidirectional_ack_packets': f['ack'],
-            'bidirectional_rst_packets': f['rst'],
-            'bidirectional_fin_packets': f['fin'],
-            'packet_asymmetry': abs(f['pkts_fwd'] - f['pkts_bwd']) / safe_pkts,
-            'byte_asymmetry': abs(f['bytes_fwd'] - f['bytes_bwd']) / (total_bytes + 1),
-            'bytes_per_packet': mean_ps,
-            'syn_ratio': f['syn'] / safe_pkts,
-            'rst_ratio': f['rst'] / safe_pkts,
-            'piat_variance_ratio': std_piat / (mean_piat + 1),
-            'protocol': key[2],
-            'src_port': key[3],
-            'dst_port': key[4],
-            'ps_variance_ratio': 0, # Approx
-            'src2dst_duration_ms': duration, # Approx mapped to total
-            'dst2src_duration_ms': duration, # Approx mapped to total
-            'duration_ratio': 1.0
-        }
-        
-        # If we have the exact feature list from the pickle, filter/order by it
-        if self.features_list:
-             vector = np.array([[features.get(feat, 0) for feat in self.features_list]])
-        else:
-             # Fallback: create array from values in arbitrary consistent order (Risky!)
-             # For the demo, we'll assume the prompt list is the order
-             vector = np.array([[v for k,v in features.items()]])
-
-        # Scale
-        if self.scaler:
-            try:
-                # Some scalers might complain about shape if feature count mismatches
-                # We catch exception just in case
-                vector = self.scaler.transform(vector)
-            except:
-                pass
-
-        # Reshape for CNN (Samples, Features, 1)
-        vector = vector.reshape(1, vector.shape[1], 1)
-        
-        # Predict
-        score = self.model.predict(vector, verbose=0)[0][0]
-        
-        ts = datetime.datetime.now().strftime('%H:%M:%S')
-        if score > 0.7: # 🔥 Threshold updated from 0.8 to 0.7 to match training
-             print(f"[{ts}] [{MAGENTA}ML   {RESET}] Flow: {key[0]}→{key[1]} | pkts={total_pkts} | score={score:.4f} | {RED}MITM 🚨{RESET}")
-             self._trigger_detection("ML ANOMALY", src_ip, src_mac, datapath, 0, f"Score: {score:.4f}", block=True)
-        else:
-             print(f"[{ts}] [{MAGENTA}ML   {RESET}] Flow: {key[0]}→{key[1]} | pkts={total_pkts} | score={score:.4f} | {GREEN}NORMAL ✅{RESET}")
-
-    def _trigger_detection(self, det_type, ip, mac, datapath, port, details, block=True):
+    def _trigger_detection(self, d_type, ip, mac, dp, port, details):
+        if mac in self.blocked_macs: return
         ts = datetime.datetime.now().strftime('%H:%M:%S')
         
-        # Banner
-        action_text = "BLOCKING MAC ADDRESS" if block else "DETECTION ONLY (ML WAITING)"
-        print(f"\n{RED if block else YELLOW}╔══════════════════════════════════════════════╗{RESET}")
-        print(f"{RED if block else YELLOW}║  🚨 MITM ATTACK DETECTED — {det_type:<14}║{RESET}")
-        print(f"{RED if block else YELLOW}║  Time:      {ts:<33}║{RESET}")
-        print(f"{RED if block else YELLOW}║  Attacker:  {mac:<33}║{RESET}")
-        print(f"{RED if block else YELLOW}║  Claimed IP: {ip:<32}║{RESET}")
-        print(f"{RED if block else YELLOW}║  ACTION:    {action_text:<33}║{RESET}")
-        print(f"{RED if block else YELLOW}╚══════════════════════════════════════════════╝{RESET}\n")
+        print(Fore.RED + Style.BRIGHT + "\n╔══════════════════════════════════════════════╗")
+        print(Fore.RED + Style.BRIGHT + f"║  🚨 MITM ATTACK DETECTED — {d_type:<18}║")
+        print(Fore.RED + Style.BRIGHT + f"║  Time:      {ts:<33}║")
+        print(Fore.RED + Style.BRIGHT + f"║  Attacker:  {ip:<10} ({mac})  ║")
+        print(Fore.RED + Style.BRIGHT + "║  Switch:    s%d  Port: %-23d║" % (dp.id, port))
+        print(Fore.RED + Style.BRIGHT + "║  ACTION:    MAC+IP blocked — DROP rule installed║")
+        print(Fore.RED + Style.BRIGHT + "╚══════════════════════════════════════════════╝\n")
         
-        self.detections.append(f"[{ts}] {det_type} -> MAC: {mac}")
+        self.detections.append(f"[{ts}] {d_type}  {ip} blocked")
+        self.blocked_macs.add(mac)
+        self.blocked_ips.add(ip)
         
-        if block:
-            self.blocked_hosts.add(mac) # Store MAC only
-            
-            # Block MAC (This effectively stops the attacker)
-            # We use a high priority to ensure this rule hits first
-            parser = datapath.ofproto_parser
-            match = parser.OFPMatch(eth_src=mac)
-            self.add_flow(datapath, 100, match, []) # Drop
-        
-        # DO NOT block the 'ip' here, because 'ip' is the victim/server 
-        # that the attacker is trying to impersonate!
+        # Install Block Rule
+        parser = dp.ofproto_parser
+        match_mac = parser.OFPMatch(eth_src=mac)
+        self.add_flow(dp, 100, match_mac, []) # Drop
+        match_ip = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip)
+        self.add_flow(dp, 100, match_ip, []) # Drop
 
-    def _monitor(self):
-        print(f"{BLUE}--- Polling Thread Started ---{RESET}")
-        count = 0
+    def _stats_timer(self):
         while True:
-            # Poll every 5 seconds
-            if not self.datapaths:
-                # No switches yet, wait
-                hub.sleep(1)
-                continue
-                
-            for dp in self.datapaths.values():
-                self._request_stats(dp)
-            
-            hub.sleep(5)
-            count += 5
-            
-            # Print dashboard every 30 seconds
-            if count >= 30:
-                self._print_stats()
-                count = 0
-
-    def _request_stats(self, datapath):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        
-        # DEBUG: print(f"Sending stats request to datapath {datapath.id}")
-        req = parser.OFPFlowStatsRequest(datapath)
-        datapath.send_msg(req)
-
-        req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
-        datapath.send_msg(req)
-
-    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
-    def _flow_stats_reply_handler(self, ev):
-        body = ev.msg.body
-        dpid = ev.msg.datapath.id
-        ts = datetime.datetime.now().isoformat()
-        
-        # DEBUG print
-        # print(f"Received flow stats reply from {dpid} with {len(body)} entries")
-
-        # Open CSV for appending
-        file_exists = os.path.isfile(self.csv_file_raw)
-        
-        # Write header if new file
-        if not file_exists:
-            with open(self.csv_file_raw, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    'timestamp', 'dpid', 'eth_src', 'eth_dst', 
-                    'ipv4_src', 'ipv4_dst', 'ip_proto', 'src_port', 'dst_port',
-                    'duration_sec', 'duration_nsec', 'packet_count', 'byte_count',
-                    'packet_rate', 'byte_rate', 'label'
-                ])
-        
-        with open(self.csv_file_raw, 'a', newline='') as f:
-            writer = csv.writer(f)
-            for stat in body:
-                # Extract fields
-                match = stat.match
-                eth_src = match.get('eth_src', '00:00:00:00:00:00')
-                eth_dst = match.get('eth_dst', '00:00:00:00:00:00')
-                ipv4_src = match.get('ipv4_src', '0.0.0.0')
-                ipv4_dst = match.get('ipv4_dst', '0.0.0.0')
-                ip_proto = match.get('ip_proto', 0)
-                src_port = match.get('tcp_src', match.get('udp_src', 0))
-                dst_port = match.get('tcp_dst', match.get('udp_dst', 0))
-                
-                duration = stat.duration_sec + stat.duration_nsec / 10**9
-                packet_rate = stat.packet_count / duration if duration > 0 else 0
-                byte_rate = stat.byte_count / duration if duration > 0 else 0
-                
-                # Label: 1 if src MAC is in blocked_hosts
-                label = 1 if eth_src in self.blocked_hosts else 0
-                
-                writer.writerow([
-                    ts, dpid, eth_src, eth_dst,
-                    ipv4_src, ipv4_dst, ip_proto, src_port, dst_port,
-                    stat.duration_sec, stat.duration_nsec, stat.packet_count, stat.byte_count,
-                    packet_rate, byte_rate, label
-                ])
-                
-                # Store raw data keyed by (dpid, match_tuple)
-                # match_tuple is just the match object's items
-                match_tuple = tuple(sorted(match.items()))
-                self.raw_flow_stats[(dpid, match_tuple)] = stat
-            
-        self.logger.info("Logged %d flows to %s", len(body), self.csv_file_raw)
-
-    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
-    def _port_stats_reply_handler(self, ev):
-        body = ev.msg.body
-        dpid = ev.msg.datapath.id
-        # We can store port stats if needed, or just log them
-        # For now, just keeping them in a dictionary as requested
-        for stat in body:
-            port_no = stat.port_no
-            # Use dpid and port_no as key
-            # (In a real app we'd use this for link utilization etc)
-            pass
+            hub.sleep(30)
+            self._print_stats()
 
     def _print_stats(self):
         ts = datetime.datetime.now().strftime('%H:%M:%S')
-        print(f"\n{BOLD}{CYAN}══════════ NETWORK STATS [{ts}] ══════════{RESET}")
-        print(f" MACs learned       : {sum(len(v) for v in self.mac_to_port.values())}")
-        print(f" ARP table entries  : {len(self.arp_table)}")
-        print(f" Active flows       : {len(self.flow_stats)}")
-        print(f"{CYAN}─────────────────────────────────────────────{RESET}")
-        print(f" RECENT DETECTIONS:")
-        if not self.detections:
-            print(" (None)")
+        print(f"\n{Fore.CYAN}══════════ NETWORK STATS [{ts}] ══════════")
+        print(f"Switches connected : {len(self.datapaths)}")
+        print(f"MACs learned       : {sum(len(v) for v in self.mac_to_port.values())}")
+        print(f"ARP table entries  : {len(self.arp_table)}")
+        print(f"Active flows       : {len(self.flows)}")
+        print(Fore.CYAN + "─────────────────────────────────────────────")
+        print("FLOW TABLE:")
+        flow_data = []
+        for f in list(self.flows.values())[-5:]:
+            total_pkts = f.s2d_packets + f.d2s_packets
+            total_bytes = f.s2d_bytes + f.d2s_bytes
+            dur = int(time.time() - f.start_time)
+            warn = " ⚠️" if f.last_score > 0.5 else ""
+            flow_data.append([f"{f.src_ip} → {f.dst_ip}", total_pkts, total_bytes, f"{dur}s", f"{f.last_score:.2f}{warn}"])
+        
+        if flow_data:
+            print(tabulate(flow_data, headers=["Flow", "Pkts", "Bytes", "Dur", "Score"], tablefmt="plain"))
         else:
-            for d in self.detections[-5:]:
-                print(f" {RED}{d}{RESET}")
-        print(f"{CYAN}─────────────────────────────────────────────{RESET}")
-        print(f" BLOCKED HOSTS (MAC):")
-        for mac in self.blocked_hosts:
-            print(f" {RED}[{mac}]{RESET}")
-        print(f"{CYAN}══════════════════════════════════════════════{RESET}\n")
+            print(" (No flows active)")
+            
+        print(Fore.CYAN + "─────────────────────────────────────────────")
+        print("DETECTIONS:")
+        for d in self.detections[-3:]:
+            print(f" {Fore.RED}{d}")
+        if not self.detections: print(" (None)")
+        
+        print(Fore.CYAN + "─────────────────────────────────────────────")
+        print("BLOCKED:")
+        print(f" MACs: {', '.join(self.blocked_macs) or '(None)'}")
+        print(f" IPs : {', '.join(self.blocked_ips) or '(None)'}")
+        print(Fore.CYAN + "══════════════════════════════════════════════\n")
 
 if __name__ == '__main__':
-    # This script is run by ryu-manager, so this block is usually not entered directly
     pass
