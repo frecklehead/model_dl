@@ -8,7 +8,7 @@ This guide details exactly how to run your MITM Detection Demo for your college 
 ```bash
 # Stop old containers
 docker compose down
-
+plots/
 # Build fresh image
 docker compose up -d --build
 ```

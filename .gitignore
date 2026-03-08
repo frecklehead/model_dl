@@ -23,17 +23,16 @@ ENV/
 .vscode/
 
 # Model artifacts (large binaries — store with DVC or Git LFS if needed)
-model/*.h5
+
 model/*.pkl
 model/*.pb
 model/*.keras
 
 # Datasets (often large — add to Git LFS or keep out of repo)
-dataset/
-archive/
+
 
 # Plots / output images
-plots/
+
 
 # Misc
 *.log
