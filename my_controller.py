@@ -187,6 +187,18 @@ class MITMController(app_manager.RyuApp):
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
+
+        # Clear state when switch connects (for demo consistency)
+        self.mac_to_port.pop(datapath.id, None)
+        self.arp_table.clear()
+        self.flows.clear()
+        self.blocked_macs.clear()
+        self.blocked_ips.clear()
+        self.detections.clear()
+        
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Switch {datapath.id} connected. State Reset.")
+
+        # Install table-miss flow entry
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)

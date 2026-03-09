@@ -82,14 +82,27 @@ def wait_for_flows(timeout=20):
     """Block until Ryu has installed at least the table-miss flow."""
     print(f"⏳ Waiting for Ryu to push flows (up to {timeout}s) …")
     for i in range(timeout):
-        r = subprocess.run(['ovs-ofctl', 'dump-flows', 's1'],
+        # Must specify OpenFlow13 version for ovs-ofctl to see flows on an OF13 switch
+        r = subprocess.run(['ovs-ofctl', '-O', 'OpenFlow13', 'dump-flows', 's1'],
                            capture_output=True, text=True)
+        # Ryu usually installs flows with a cookie (e.g. cookie=0x0)
         n = r.stdout.count('cookie=')
         if n > 0:
             print(f"  ✅ {n} flow(s) installed by Ryu")
             return True
+        
+        # Diagnostic: show error if ovs-ofctl failed
+        if r.returncode != 0 and i == timeout - 1:
+            print(f"  ❌ ovs-ofctl failed (code {r.returncode}): {r.stderr.strip()}")
+            
         time.sleep(1)
+    
     print("  ⚠️  No flows after timeout — forwarding may fail")
+    # Last resort: dump what we found
+    last_check = subprocess.run(['ovs-ofctl', '-O', 'OpenFlow13', 'dump-flows', 's1'],
+                                capture_output=True, text=True)
+    if last_check.stdout.strip():
+        print(f"  DEBUG: Current Table:\n{last_check.stdout.strip()}")
     return False
 
 # ── Connectivity check ─────────────────────────────────
@@ -103,8 +116,18 @@ def check_ping(src_host, dst_ip, label, retries=3):
     print(f"  ❌ {label}: UNREACHABLE after {retries} tries")
     return False
 
+def cleanup_orphans():
+    """Kill any leftover background processes from previous runs."""
+    print("🧹 Cleaning up leftover processes ...")
+    subprocess.run(['pkill', '-f', 'attacker_mitm.py'], capture_output=True)
+    subprocess.run(['pkill', '-f', 'victim_traffic.py'], capture_output=True)
+    subprocess.run(['pkill', '-f', 'server_login.py'], capture_output=True)
+    # Also clear any OVS flows that might be hanging
+    subprocess.run(['ovs-ofctl', '-O', 'OpenFlow13', 'del-flows', 's1'], capture_output=True)
+
 # ── Main demo ──────────────────────────────────────────
 def run_demo():
+    cleanup_orphans()
     net = create_topology()
     net.start()
 
