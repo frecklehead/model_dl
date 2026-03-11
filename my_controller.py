@@ -135,7 +135,7 @@ class MITMController(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(MITMController, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
-        self.arp_table = {}  # IP -> MAC
+        self.arp_table = {}  # IP -> (MAC, port)
         self.flows = {}      # (ip1, ip2, port1, port2, proto) -> FlowTracker
         self.datapaths = {}
         self.blocked_macs = set()
@@ -267,14 +267,27 @@ class MITMController(app_manager.RyuApp):
 
     def _handle_arp(self, datapath, in_port, pkt_arp, eth, ts):
         opcode = "REQUEST" if pkt_arp.opcode == arp.ARP_REQUEST else "REPLY"
-        print(f"[{ts}] [{Fore.YELLOW}ARP  {Style.RESET_ALL}] {opcode:<8} {pkt_arp.src_ip} ({eth.src}) → {pkt_arp.dst_ip}")
+        src_ip = pkt_arp.src_ip
+        src_mac = eth.src
         
         # Layer 1 Detection (ARP Spoofing)
-        if pkt_arp.src_ip in self.arp_table:
-            if self.arp_table[pkt_arp.src_ip] != eth.src:
-                self._trigger_detection("ARP SPOOF", pkt_arp.src_ip, eth.src, datapath, in_port, "Impersonating known IP")
+        if src_ip in self.arp_table:
+            old_mac, old_port = self.arp_table[src_ip]
+            
+            # CRITICAL: Only trigger if the MAC changes AND it's on a different port.
+            # Legit OS behavior might occasionally change MAC on same port (unlikely in Mininet, but safer).
+            # MITM specifically usually involves the attacker spoofing from their own port.
+            if old_mac != src_mac:
+                if old_port != in_port:
+                    details = f"IP {src_ip} moved from Port {old_port} ({old_mac}) to Port {in_port} ({src_mac})"
+                    self._trigger_detection("ARP SPOOF", src_ip, src_mac, datapath, in_port, details)
+                else:
+                    # Update table if it's the same port (allow legit MAC changes on same interface)
+                    self.arp_table[src_ip] = (src_mac, in_port)
         else:
-            self.arp_table[pkt_arp.src_ip] = eth.src
+            self.arp_table[src_ip] = (src_mac, in_port)
+            
+        print(f"[{ts}] [{Fore.YELLOW}ARP  {Style.RESET_ALL}] {opcode:<8} {src_ip} ({src_mac}) on Port {in_port}")
 
     def _handle_ipv4(self, datapath, in_port, pkt, pkt_ipv4, eth, ts):
         src_ip = pkt_ipv4.src
@@ -337,10 +350,10 @@ class MITMController(app_manager.RyuApp):
         score = self.model.predict(vector, verbose=0)[0][0]
         flow.last_score = score
         
-        status = f"{Fore.RED}MITM 🚨" if score > 0.5 else f"{Fore.GREEN}NORMAL ✅"
+        status = f"{Fore.RED}MITM 🚨" if score > 0.7 else f"{Fore.GREEN}NORMAL ✅"
         print(f"[{ts}] [{Fore.MAGENTA}ML   {Style.RESET_ALL}] Flow: {flow.src_ip}→{flow.dst_ip} | pkts={flow.s2d_packets+flow.d2s_packets} | score={score:.4f} | {status}")
         
-        if score > 0.8:
+        if score > 0.85:
             flow.is_mitm = True
             self._trigger_detection("ML DETECT", flow.src_ip, src_mac, datapath, 0, f"Score: {score:.4f}")
 
