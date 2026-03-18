@@ -15,6 +15,7 @@ tf-env/
 venv/
 env/
 ENV/
+*.pyc
 
 # Jupyter
 .ipynb_checkpoints/
