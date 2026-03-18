@@ -3,20 +3,18 @@
 ssl_strip.py — SSL Stripping attack simulator (runs on device1)
 
 Generates flow-level signatures of SSL stripping:
-- Rapid TCP connection attempts to port 443
-- Each attempt creates SYN (s2d) + RST response (d2s) packets in the flow
-- After 20 packets, the ML model sees dst_port=443 and classifies as SSL STRIPPING
+- Rapid TCP SYN packets to port 443 using a FIXED source port
+- All packets land in the SAME flow entry in the controller
+- After 20 packets, rule-based detection sees dst_port=443 → SSL STRIPPING
 
 Usage (from Mininet CLI):
     device1 python3 /tmp/ssl_strip.py 10.0.0.2
 """
 
-import socket, time, sys, threading
+import sys, time, os
 
 SERVER_IP = sys.argv[1] if len(sys.argv) > 1 else "10.0.0.2"
-SSL_PORT  = 443   # HTTPS port — controller classifies port 443 flows as SSL Stripping
-FALLBACK  = 8080  # For actual data transfer to ensure enough bytes flow
-
+IFACE = sys.argv[2] if len(sys.argv) > 2 else None
 LOG = "/tmp/ssl_strip_output.txt"
 
 def log(msg):
@@ -28,53 +26,42 @@ def log(msg):
     except:
         pass
 
-log(f"[SSL-STRIP] Starting SSL Stripping simulation → {SERVER_IP}:{SSL_PORT}")
-log(f"[SSL-STRIP] Generating port-443 flow signatures (20 pkts needed for ML)")
+# Import scapy for raw packet control (fixed source port)
+from scapy.all import *
 
-# Phase 1: Rapid 443 connection attempts (each gets RST → 2 pkts per attempt)
-# 15 attempts × ~2 pkts = ~30 packets → ML fires confidently
-def ssl_port_flood():
-    hits = 0
-    for i in range(20):
+# Detect interface
+if not IFACE:
+    for iface in get_if_list():
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.5)
-            s.connect((SERVER_IP, SSL_PORT))   # Will get RST since nothing listens on 443
-            s.close()
-        except (ConnectionRefusedError, OSError):
-            hits += 1  # RST received — this is exactly the packet we want
-        except Exception:
-            pass
-        time.sleep(0.15)
-    log(f"[SSL-STRIP] Phase 1 done: {hits} RST responses = ~{hits*2} packets in 443 flow")
+            ip = get_if_addr(iface)
+            if ip.startswith('10.0.0.'):
+                IFACE = iface
+                break
+        except:
+            continue
+    if not IFACE:
+        IFACE = str(conf.iface)
 
-# Phase 2: Bulk HTTP traffic with HTTPS upgrade markers (relay pattern)
-def ssl_relay_traffic():
-    time.sleep(1)  # after port flood has started
-    for i in range(15):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(2)
-            s.connect((SERVER_IP, FALLBACK))
-            # Send large payload with HTTPS upgrade header (SSL stripping relay signature)
-            req = (b"GET / HTTP/1.1\r\n"
-                   b"Host: " + SERVER_IP.encode() + b"\r\n"
-                   b"Upgrade-Insecure-Requests: 1\r\n"
-                   b"X-Forwarded-Proto: https\r\n\r\n")
-            s.send(req)
-            s.recv(4096)
-            time.sleep(0.1)
-            s.close()
-        except Exception:
-            pass
-        time.sleep(0.2)
-    log("[SSL-STRIP] Phase 2 done: HTTP relay traffic sent")
+MY_MAC = get_if_hwaddr(IFACE)
+MY_IP  = get_if_addr(IFACE)
+FIXED_SPORT = 44300  # Fixed source port so all packets stay in ONE flow
 
-t1 = threading.Thread(target=ssl_port_flood, daemon=True)
-t2 = threading.Thread(target=ssl_relay_traffic, daemon=True)
-t1.start()
-t2.start()
-t1.join()
-t2.join()
+log(f"[SSL-STRIP] Starting SSL Stripping simulation → {SERVER_IP}:443")
+log(f"[SSL-STRIP] Interface: {IFACE}, IP: {MY_IP}, MAC: {MY_MAC}")
+log(f"[SSL-STRIP] Using fixed sport={FIXED_SPORT} → dport=443 (single flow)")
 
-log("[SSL-STRIP] SSL Stripping simulation complete — check Ryu for SSL STRIPPING alert")
+# Send 30 SYN packets to port 443 with FIXED source port
+# All land in the same flow → controller hits 20-packet threshold → SSL STRIPPING
+for i in range(30):
+    pkt = (
+        Ether(src=MY_MAC, dst="ff:ff:ff:ff:ff:ff") /
+        IP(src=MY_IP, dst=SERVER_IP) /
+        TCP(sport=FIXED_SPORT, dport=443, flags="S", seq=1000 + i * 100)
+    )
+    sendp(pkt, iface=IFACE, verbose=False)
+    if i % 10 == 0:
+        log(f"[SSL-STRIP] SYN burst {i+1}/30 → {SERVER_IP}:443")
+    time.sleep(0.15)
+
+log("[SSL-STRIP] Done — 30 SYN packets sent to port 443 (single flow)")
+log("[SSL-STRIP] Check Ryu terminal for SSL STRIPPING detection")

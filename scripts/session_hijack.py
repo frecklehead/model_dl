@@ -3,9 +3,10 @@
 session_hijack.py — TCP Session Hijacking via RST injection (runs on device2)
 
 Generates flow-level signatures of session hijacking:
-- First sends ACK packets into an established flow (ack_count > 5)
-- Then sends RST packets at high rate (rst_ratio > 0.15)
-- After 20+ packets, ML sees SESSION HIJACKING pattern and classifies it
+- All packets use the SAME fixed src_port/dst_port so they land in ONE flow
+- First sends ACK packets (ack_count > 5)
+- Then sends RST packets (rst_ratio > 0.15)
+- Controller sees the pattern → SESSION HIJACKING
 
 Uses Scapy for raw packet injection.
 
@@ -44,47 +45,44 @@ if not IFACE:
     if not IFACE:
         IFACE = str(conf.iface)
 
-log(f"[HIJACK] TCP Session Hijacking simulation on {IFACE}")
-log(f"[HIJACK] Injecting into: {VICTIM_IP} ↔ {SERVER_IP}:8080")
-
 MY_MAC = get_if_hwaddr(IFACE)
 MY_IP  = get_if_addr(IFACE)
 
-# Phase 1: Send ACK packets to build ack_count > 5 in the flow
-log("[HIJACK] Phase 1: Injecting ACK packets (establishing session context)...")
+# FIXED ports so ALL packets land in the SAME flow entry
+FIXED_SPORT = 55555
+FIXED_DPORT = 8080
+
+log(f"[HIJACK] Session Hijacking simulation on {IFACE}")
+log(f"[HIJACK] Injecting into flow: {MY_IP}:{FIXED_SPORT} → {SERVER_IP}:{FIXED_DPORT}")
+log(f"[HIJACK] All packets use same ports → single flow in controller")
+
+# Phase 1: ACK packets (build ack_count > 5)
+log("[HIJACK] Phase 1: Injecting ACK packets...")
 for i in range(10):
     pkt = (
         Ether(src=MY_MAC, dst="ff:ff:ff:ff:ff:ff") /
-        IP(src=VICTIM_IP, dst=SERVER_IP) /
-        TCP(sport=10000 + i, dport=8080, flags="A",
+        IP(src=MY_IP, dst=SERVER_IP) /
+        TCP(sport=FIXED_SPORT, dport=FIXED_DPORT, flags="A",
             seq=1000 + i * 100, ack=2000 + i * 100)
     )
     sendp(pkt, iface=IFACE, verbose=False)
     time.sleep(0.1)
+log("[HIJACK] 10 ACK packets sent")
 
-log("[HIJACK] Phase 1 done: 10 ACK packets injected")
-
-# Phase 2: RST injection flood — hijack/terminate the TCP session
-log("[HIJACK] Phase 2: RST injection (session hijacking) ...")
-for i in range(20):
-    # RST from victim side (terminate victim→server session)
-    pkt_rst_v = (
+# Phase 2: RST injection (build rst_ratio > 0.15)
+log("[HIJACK] Phase 2: RST injection...")
+for i in range(25):
+    pkt = (
         Ether(src=MY_MAC, dst="ff:ff:ff:ff:ff:ff") /
-        IP(src=VICTIM_IP, dst=SERVER_IP) /
-        TCP(sport=10000 + i, dport=8080, flags="R",
+        IP(src=MY_IP, dst=SERVER_IP) /
+        TCP(sport=FIXED_SPORT, dport=FIXED_DPORT, flags="R",
             seq=5000 + i * 50)
     )
-    # RST+ACK from server side (forged, inject into return path)
-    pkt_rst_s = (
-        Ether(src=MY_MAC, dst="ff:ff:ff:ff:ff:ff") /
-        IP(src=SERVER_IP, dst=VICTIM_IP) /
-        TCP(sport=8080, dport=10000 + i, flags="RA",
-            seq=6000 + i * 50, ack=5001 + i * 50)
-    )
-    sendp([pkt_rst_v, pkt_rst_s], iface=IFACE, verbose=False)
-    if i % 5 == 0:
-        log(f"[HIJACK] RST burst {i+1}/20 sent")
-    time.sleep(0.15)
+    sendp(pkt, iface=IFACE, verbose=False)
+    if i % 10 == 0:
+        log(f"[HIJACK] RST burst {i+1}/25")
+    time.sleep(0.1)
+log("[HIJACK] 25 RST packets sent")
 
-log("[HIJACK] Phase 2 done: RST injection complete")
-log("[HIJACK] Session Hijacking simulation complete — check Ryu for SESSION HIJACKING alert")
+log(f"[HIJACK] Total: 35 packets in flow {MY_IP}:{FIXED_SPORT}→{SERVER_IP}:{FIXED_DPORT}")
+log("[HIJACK] Check Ryu for SESSION HIJACKING detection")

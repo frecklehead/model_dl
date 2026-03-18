@@ -358,10 +358,36 @@ class MITMController(app_manager.RyuApp):
         direction = 's2d' if (src_ip, src_port) == key[0] else 'd2s'
         self.flows[key].update(pkt_ipv4.total_length, direction, flags)
         
+        flow = self.flows[key]
+        total_p = flow.s2d_packets + flow.d2s_packets
+        
+        # Rule-based detection (runs independently of ML model)
+        if total_p >= 20 and total_p % 10 == 0:
+            self._check_flow_rules(flow, ts, datapath, eth.src)
+        
         # ML Analysis every 20 packets
-        total_p = self.flows[key].s2d_packets + self.flows[key].d2s_packets
         if total_p % 20 == 0:
             self._run_ml(key, ts, datapath, eth.src)
+
+    def _check_flow_rules(self, flow, ts, datapath, src_mac):
+        """Rule-based MITM sub-type detection — runs independently of ML model."""
+        total_pkts = flow.s2d_packets + flow.d2s_packets
+        safe_pkts = total_pkts if total_pkts > 0 else 1
+        rst_r = flow.rst_count / safe_pkts
+
+        # SSL Stripping: flow targeting TLS port (443/8443)
+        if flow.dst_port in (443, 8443) or flow.src_port in (443, 8443):
+            self._trigger_detection(
+                "SSL STRIPPING", flow.src_ip, src_mac, datapath, 0,
+                f"TLS port flow detected (port={flow.dst_port}, pkts={total_pkts})"
+            )
+
+        # Session Hijacking: high RST ratio + ACK count (RST injection attack)
+        if rst_r > 0.15 and flow.ack_count > 5:
+            self._trigger_detection(
+                "SESSION HIJACKING", flow.src_ip, src_mac, datapath, 0,
+                f"RST injection (rst_ratio={rst_r:.2f}, acks={flow.ack_count}, pkts={total_pkts})"
+            )
 
     def _run_ml(self, key, ts, datapath, src_mac):
         if not self.model: return

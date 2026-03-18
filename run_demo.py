@@ -207,7 +207,7 @@ def run_demo():
     device1.cmd('python3 /tmp/ssl_strip.py 10.0.0.2 > /tmp/ssl_strip_output.txt 2>&1 &')
     print("   device1 generating port-443 TCP flows (SSL stripping signature)...")
     time.sleep(8)  # Give ML time to accumulate 20+ packets
-    print(f"   Log: {device1.cmd('tail -5 /tmp/ssl_strip_output.txt 2>/dev/null').strip()}")
+    print(f"   Log: {device1.cmd('tail -5 /tmp/ssl_strip_output.txt | strings 2>/dev/null').strip()}")
 
     # ── Phase 5: Session Hijacking (device2) ──────────────
     print("\n🔒 Phase 5: Session Hijacking via RST Injection (device2) ...")
@@ -215,7 +215,7 @@ def run_demo():
     device2.cmd('python3 /tmp/session_hijack.py 10.0.0.1 10.0.0.2 device2-eth0 > /tmp/session_hijack_output.txt 2>&1 &')
     print("   device2 injecting ACK+RST packets into victim-server flow...")
     time.sleep(10)  # RST injection takes ~8s for 30 packets
-    print(f"   Log: {device2.cmd('tail -5 /tmp/session_hijack_output.txt 2>/dev/null').strip()}")
+    print(f"   Log: {device2.cmd('tail -5 /tmp/session_hijack_output.txt | strings 2>/dev/null').strip()}")
 
     # ── Phase 6: ARP Poisoning MITM (attacker) ───────────
     print(f"\n🔴 Phase 6: ARP Poisoning MITM (interface={attacker_iface}) ...")    
