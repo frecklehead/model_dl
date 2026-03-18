@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+tf-env/
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# VS Code
+.vscode/
+
+# Model artifacts (large binaries — store with DVC or Git LFS if needed)
+
+
+# Datasets (often large — add to Git LFS or keep out of repo)
+
+
+# Plots / output images
+
+
+# Misc
+*.log
+*.tmp
+.DS_Store
+fix_notebook.py
+fix_notebook.ipynb
+tf-env/
+venv/
+.venv/
+__pycache__/
+*.pyc
