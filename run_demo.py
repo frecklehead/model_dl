@@ -11,11 +11,12 @@ from mininet.net import Mininet
 from mininet.node import RemoteController, OVSSwitch
 from mininet.cli import CLI
 from mininet.log import setLogLevel
-import time, os, shutil, subprocess
+import time, os, stat, shutil, subprocess
 
 # Scripts live in a 'scripts/' subfolder next to this file
 _HERE        = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS_DIR  = os.path.join(_HERE, 'scripts')
+
 
 # ── Topology ───────────────────────────────────────────
 def create_topology():
@@ -37,8 +38,21 @@ def create_topology():
 def deploy_scripts():
     """Copy scripts/ → /tmp/ (all Mininet hosts share the root filesystem)."""
     print("\n📂 Deploying scripts to /tmp ...")
-    for fname in ['attacker_mitm.py', 'victim_traffic.py', 'server_login.py',
-                  'ssl_strip.py', 'session_hijack.py']:
+
+    target_scripts = ['attacker_mitm.py', 'victim_traffic.py', 'server_login.py']
+
+    # Remove any stale copies that may be owned by a different user/run
+    for fname in target_scripts:
+        dst = f'/tmp/{fname}'
+        if os.path.exists(dst):
+            try:
+                os.chmod(dst, stat.S_IWRITE | stat.S_IREAD)
+                os.remove(dst)
+            except PermissionError:
+                print(f"  ⚠️  Could not remove stale {dst} — try: sudo rm {dst}")
+
+    # Copy fresh scripts
+    for fname in target_scripts:
         src = os.path.join(SCRIPTS_DIR, fname)
         dst = f'/tmp/{fname}'
         if os.path.exists(src):
@@ -86,20 +100,18 @@ def wait_for_flows(timeout=20):
         # Must specify OpenFlow13 version for ovs-ofctl to see flows on an OF13 switch
         r = subprocess.run(['ovs-ofctl', '-O', 'OpenFlow13', 'dump-flows', 's1'],
                            capture_output=True, text=True)
-        # Ryu usually installs flows with a cookie (e.g. cookie=0x0)
         n = r.stdout.count('cookie=')
         if n > 0:
             print(f"  ✅ {n} flow(s) installed by Ryu")
             return True
-        
+
         # Diagnostic: show error if ovs-ofctl failed
         if r.returncode != 0 and i == timeout - 1:
             print(f"  ❌ ovs-ofctl failed (code {r.returncode}): {r.stderr.strip()}")
-            
+
         time.sleep(1)
-    
+
     print("  ⚠️  No flows after timeout — forwarding may fail")
-    # Last resort: dump what we found
     last_check = subprocess.run(['ovs-ofctl', '-O', 'OpenFlow13', 'dump-flows', 's1'],
                                 capture_output=True, text=True)
     if last_check.stdout.strip():
@@ -122,7 +134,7 @@ def cleanup_orphans():
     print("🧹 Cleaning up leftover processes ...")
     subprocess.run(['pkill', '-f', 'attacker_mitm.py'], capture_output=True)
     subprocess.run(['pkill', '-f', 'victim_traffic.py'], capture_output=True)
-    subprocess.run(['pkill', '-f', 'server_login.py'], capture_output=True)
+    subprocess.run(['pkill', '-f', 'server_login.py'],  capture_output=True)
     # Also clear any OVS flows that might be hanging
     subprocess.run(['ovs-ofctl', '-O', 'OpenFlow13', 'del-flows', 's1'], capture_output=True)
 
@@ -132,10 +144,10 @@ def run_demo():
     net = create_topology()
     net.start()
 
-    victim   = net.get('victim')
-    server   = net.get('server')
-    attacker = net.get('attacker')
-    device1  = net.get('device1')
+    victim         = net.get('victim')
+    server         = net.get('server')
+    attacker       = net.get('attacker')
+    device1        = net.get('device1')
     attacker_iface = 'attacker-eth0'
 
     deploy_scripts()
@@ -154,7 +166,6 @@ def run_demo():
 
     # ── Phase 1: ARP warm-up ───────────────────────────────
     print("\n📡 Phase 1: Warming ARP caches …")
-    # All 6 directions so every host knows every other host's MAC
     pairs = [
         (victim,   '10.0.0.2'),
         (victim,   '10.0.0.100'),
@@ -221,7 +232,6 @@ def run_demo():
     print(f"\n🔴 Phase 6: ARP Poisoning MITM (interface={attacker_iface}) ...")    
     attacker.cmd('sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1')
     attacker.cmd('iptables -F; iptables -t nat -F; iptables -P FORWARD ACCEPT')
-    # Pass: victim_ip  server_ip  interface_name
     attacker.cmd(
         f'python3 /tmp/attacker_mitm.py 10.0.0.1 10.0.0.2 {attacker_iface} '
         f'> /tmp/attacker_output.txt 2>&1 &'
@@ -237,7 +247,6 @@ def run_demo():
 
     # ── Phase 5: Victim sends credentials ─────────────────
     print("\n💀 Phase 5: Victim sending credentials (being stolen) …")
-    # victim_traffic.py accepts SERVER_IP as optional first arg
     victim.cmd('python3 /tmp/victim_traffic.py 10.0.0.2 > /tmp/victim_output.txt 2>&1 &')
     time.sleep(6)
 

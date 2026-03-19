@@ -33,6 +33,7 @@ RUN pip install --no-cache-dir \
     requests \
     tabulate \
     colorama \
+    scikit-learn \
     tensorflow-cpu
 
 # Create working directory
