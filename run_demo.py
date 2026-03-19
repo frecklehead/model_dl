@@ -37,7 +37,8 @@ def create_topology():
 def deploy_scripts():
     """Copy scripts/ → /tmp/ (all Mininet hosts share the root filesystem)."""
     print("\n📂 Deploying scripts to /tmp ...")
-    for fname in ['attacker_mitm.py', 'victim_traffic.py', 'server_login.py']:
+    for fname in ['attacker_mitm.py', 'victim_traffic.py', 'server_login.py',
+                  'ssl_strip.py', 'session_hijack.py']:
         src = os.path.join(SCRIPTS_DIR, fname)
         dst = f'/tmp/{fname}'
         if os.path.exists(src):
@@ -201,8 +202,23 @@ def run_demo():
     time.sleep(5)
     print("✅ Baseline done — Ryu should show NORMAL ML scores")
 
-    # ── Phase 4: Launch MITM attack ────────────────────────
-    print(f"\n🔴 Phase 4: Launching MITM (interface={attacker_iface}) …")
+    # ── Phase 4: SSL Stripping (device1) ─────────────────
+    print("\n🔐 Phase 4: SSL Stripping Attack (device1 → server:443) ...")
+    device1.cmd('python3 /tmp/ssl_strip.py 10.0.0.2 > /tmp/ssl_strip_output.txt 2>&1 &')
+    print("   device1 generating port-443 TCP flows (SSL stripping signature)...")
+    time.sleep(8)  # Give ML time to accumulate 20+ packets
+    print(f"   Log: {device1.cmd('tail -5 /tmp/ssl_strip_output.txt | strings 2>/dev/null').strip()}")
+
+    # ── Phase 5: Session Hijacking (device2) ──────────────
+    print("\n🔒 Phase 5: Session Hijacking via RST Injection (device2) ...")
+    device2  = net.get('device2')
+    device2.cmd('python3 /tmp/session_hijack.py 10.0.0.1 10.0.0.2 device2-eth0 > /tmp/session_hijack_output.txt 2>&1 &')
+    print("   device2 injecting ACK+RST packets into victim-server flow...")
+    time.sleep(10)  # RST injection takes ~8s for 30 packets
+    print(f"   Log: {device2.cmd('tail -5 /tmp/session_hijack_output.txt | strings 2>/dev/null').strip()}")
+
+    # ── Phase 6: ARP Poisoning MITM (attacker) ───────────
+    print(f"\n🔴 Phase 6: ARP Poisoning MITM (interface={attacker_iface}) ...")    
     attacker.cmd('sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1')
     attacker.cmd('iptables -F; iptables -t nat -F; iptables -P FORWARD ACCEPT')
     # Pass: victim_ip  server_ip  interface_name

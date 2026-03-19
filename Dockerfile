@@ -26,12 +26,9 @@ RUN pip install --no-cache-dir git+https://github.com/faucetsdn/ryu.git
 # Re-enforce eventlet version to prevent Ryu from downgrading it during its own installation
 RUN pip install --no-cache-dir eventlet==0.36.1 dnspython==2.2.1
 
-# Install ML, Data Science, and Networking libraries
+# Install ML and Networking libraries
 RUN pip install --no-cache-dir \
     numpy \
-    pandas \
-    scikit-learn \
-    matplotlib \
     joblib \
     requests \
     tabulate \

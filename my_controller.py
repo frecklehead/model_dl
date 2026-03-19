@@ -89,6 +89,48 @@ class FlowTracker:
         if flags & 0x04: self.rst_count += 1
         if flags & 0x01: self.fin_count += 1
 
+    def classify_mitm_type(self):
+        """
+        Classify the MITM attack subtype using flow-level behavioral signals.
+        Returns a tuple of (attack_type_string, reason_string).
+        """
+        total_pkts = self.s2d_packets + self.d2s_packets
+        total_bytes = self.s2d_bytes + self.d2s_bytes
+        safe_pkts = total_pkts if total_pkts > 0 else 1
+
+        pkt_asym = abs(self.s2d_packets - self.d2s_packets) / safe_pkts
+        byte_asym = abs(self.s2d_bytes - self.d2s_bytes) / (total_bytes + 1)
+        rst_r = self.rst_count / safe_pkts
+        syn_r = self.syn_count / safe_pkts
+        mean_piat = np.mean(self.piats) if self.piats else 0
+        std_piat = np.std(self.piats) if self.piats else 0
+        piat_cv = std_piat / (mean_piat + 1e-6)  # coefficient of variation
+
+        # 1. SSL Stripping: HTTP traffic appearing on port 443-neighbour flows
+        #    or plain HTTP (80/8080) with very low piat variance (downgraded relay)
+        if self.dst_port in (443, 8443) or self.src_port in (443, 8443):
+            return ("SSL STRIPPING", f"TLS port flow downgraded (port={self.dst_port or self.src_port})")
+
+        # 2. Session Hijacking: high RST ratio mid-flow (RST injection) + ongoing ACKs
+        if rst_r > 0.15 and self.ack_count > 5:
+            return ("SESSION HIJACKING", f"RST injection detected (rst_ratio={rst_r:.2f}, acks={self.ack_count})")
+
+        # 3. Relay / Traffic Interception: both high packet & byte asymmetry
+        #    Classic sign of relay — one side receives more than it should
+        if pkt_asym > 0.35 and byte_asym > 0.30:
+            return ("PACKET INTERCEPTION", f"Bidirectional asymmetry (pkt={pkt_asym:.2f}, byte={byte_asym:.2f})")
+
+        # 4. Flood Relay (bulk connection flood by attacker to generate ML trigger)
+        #    Very low PIAT variance = robotic/automated traffic, not human
+        if total_pkts > 30 and piat_cv < 0.5 and mean_piat < 50:
+            return ("RELAY FLOOD", f"Automated relay pattern (piat_cv={piat_cv:.2f}, mean_piat={mean_piat:.1f}ms)")
+
+        # 5. Generic interception if the ML model flagged it but no specific sub-type
+        if pkt_asym > 0.15:
+            return ("TRAFFIC RELAY", f"Mild asymmetry suggestive of relay (pkt_asym={pkt_asym:.2f})")
+
+        return ("ML ANOMALY", "Flow statistics deviate from normal baseline")
+
     def get_features(self):
         duration = (self.last_time - self.start_time) * 1000
         total_pkts = self.s2d_packets + self.d2s_packets
@@ -135,12 +177,13 @@ class MITMController(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(MITMController, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
-        self.arp_table = {}  # IP -> (MAC, port)
+        self.arp_table = {}  # IP -> MAC
         self.flows = {}      # (ip1, ip2, port1, port2, proto) -> FlowTracker
         self.datapaths = {}
         self.blocked_macs = set()
         self.blocked_ips = set()
         self.detections = []
+        self.triggered_alerts = set()
         
         # Load Model
         self.model = None
@@ -195,6 +238,7 @@ class MITMController(app_manager.RyuApp):
         self.blocked_macs.clear()
         self.blocked_ips.clear()
         self.detections.clear()
+        self.triggered_alerts.clear()
         
         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Switch {datapath.id} connected. State Reset.")
 
@@ -231,7 +275,7 @@ class MITMController(app_manager.RyuApp):
         src_mac = eth.src
         dst_mac = eth.dst
         
-        # Blocked check
+        # Drop packets from already-fully-blocked MACs
         if src_mac in self.blocked_macs: return
 
         # ARP handling
@@ -267,27 +311,18 @@ class MITMController(app_manager.RyuApp):
 
     def _handle_arp(self, datapath, in_port, pkt_arp, eth, ts):
         opcode = "REQUEST" if pkt_arp.opcode == arp.ARP_REQUEST else "REPLY"
-        src_ip = pkt_arp.src_ip
-        src_mac = eth.src
+        print(f"[{ts}] [{Fore.YELLOW}ARP  {Style.RESET_ALL}] {opcode:<8} {pkt_arp.src_ip} ({eth.src}) → {pkt_arp.dst_ip}")
         
-        # Layer 1 Detection (ARP Spoofing)
+        src_ip, src_mac = pkt_arp.src_ip, eth.src
         if src_ip in self.arp_table:
-            old_mac, old_port = self.arp_table[src_ip]
-            
-            # CRITICAL: Only trigger if the MAC changes AND it's on a different port.
-            # Legit OS behavior might occasionally change MAC on same port (unlikely in Mininet, but safer).
-            # MITM specifically usually involves the attacker spoofing from their own port.
-            if old_mac != src_mac:
-                if old_port != in_port:
-                    details = f"IP {src_ip} moved from Port {old_port} ({old_mac}) to Port {in_port} ({src_mac})"
-                    self._trigger_detection("ARP SPOOF", src_ip, src_mac, datapath, in_port, details)
-                else:
-                    # Update table if it's the same port (allow legit MAC changes on same interface)
-                    self.arp_table[src_ip] = (src_mac, in_port)
+            if self.arp_table[src_ip] != src_mac:
+                known = self.arp_table[src_ip]
+                self._trigger_detection(
+                    "ARP POISONING", src_ip, src_mac, datapath, in_port,
+                    f"IP {src_ip} was bound to {known}, now claiming {src_mac}"
+                )
         else:
-            self.arp_table[src_ip] = (src_mac, in_port)
-            
-        print(f"[{ts}] [{Fore.YELLOW}ARP  {Style.RESET_ALL}] {opcode:<8} {src_ip} ({src_mac}) on Port {in_port}")
+            self.arp_table[src_ip] = src_mac
 
     def _handle_ipv4(self, datapath, in_port, pkt, pkt_ipv4, eth, ts):
         src_ip = pkt_ipv4.src
@@ -304,21 +339,14 @@ class MITMController(app_manager.RyuApp):
         if pkt_tcp:
             src_port, dst_port = pkt_tcp.src_port, pkt_tcp.dst_port
             flags = pkt_tcp.bits
-            type_str = "TCP  "
-            if dst_port == 8080 or src_port == 8080:
-                type_str = "HTTP "
-                # Very basic HTTP detection from payload if possible
-                payload = str(pkt.protocols[-1])
-                if "GET" in payload: info = "| GET /"
-                elif "POST" in payload: info = "| POST /login " + (Fore.RED + "⚠️" if "password" in payload.lower() else "")
-            
+            type_str = "HTTP " if (dst_port in (8080, 80, 443) or src_port in (8080, 80, 443)) else "TCP  "
             log_msg = f"[{ts}] [{Fore.BLUE}{type_str}{Style.RESET_ALL}] {src_ip}:{src_port} → {dst_ip}:{dst_port} {info}"
         elif pkt_udp:
             src_port, dst_port = pkt_udp.src_port, pkt_udp.dst_port
-            type_str = "UDP  "
+            type_str = "DNS  " if (dst_port == 53 or src_port == 53) else "UDP  "
             log_msg = f"[{ts}] [{Fore.BLUE}{type_str}{Style.RESET_ALL}] {src_ip}:{src_port} → {dst_ip}:{dst_port}"
         else:
-            log_msg = f"[{ts}] [{Fore.BLUE}{type_str}{Style.RESET_ALL}] {src_ip} → {dst_ip} | pkts=1 bytes={pkt_ipv4.total_length}"
+            log_msg = f"[{ts}] [{Fore.BLUE}{type_str}{Style.RESET_ALL}] {src_ip} → {dst_ip} | bytes={pkt_ipv4.total_length}"
 
         print(log_msg)
 
@@ -327,58 +355,96 @@ class MITMController(app_manager.RyuApp):
         if key not in self.flows:
             self.flows[key] = FlowTracker(src_ip, dst_ip, src_port, dst_port, proto)
         
-        dir = 's2d' if (src_ip, src_port) == key[0] else 'd2s'
-        self.flows[key].update(pkt_ipv4.total_length, dir, flags)
+        direction = 's2d' if (src_ip, src_port) == key[0] else 'd2s'
+        self.flows[key].update(pkt_ipv4.total_length, direction, flags)
+        
+        flow = self.flows[key]
+        total_p = flow.s2d_packets + flow.d2s_packets
+        
+        # Rule-based detection (runs independently of ML model)
+        if total_p >= 20 and total_p % 10 == 0:
+            self._check_flow_rules(flow, ts, datapath, eth.src)
         
         # ML Analysis every 20 packets
-        total_p = self.flows[key].s2d_packets + self.flows[key].d2s_packets
         if total_p % 20 == 0:
             self._run_ml(key, ts, datapath, eth.src)
+
+    def _check_flow_rules(self, flow, ts, datapath, src_mac):
+        """Rule-based MITM sub-type detection — runs independently of ML model."""
+        total_pkts = flow.s2d_packets + flow.d2s_packets
+        safe_pkts = total_pkts if total_pkts > 0 else 1
+        rst_r = flow.rst_count / safe_pkts
+
+        # SSL Stripping: flow targeting TLS port (443/8443)
+        if flow.dst_port in (443, 8443) or flow.src_port in (443, 8443):
+            self._trigger_detection(
+                "SSL STRIPPING", flow.src_ip, src_mac, datapath, 0,
+                f"TLS port flow detected (port={flow.dst_port}, pkts={total_pkts})"
+            )
+
+        # Session Hijacking: high RST ratio + ACK count (RST injection attack)
+        if rst_r > 0.15 and flow.ack_count > 5:
+            self._trigger_detection(
+                "SESSION HIJACKING", flow.src_ip, src_mac, datapath, 0,
+                f"RST injection (rst_ratio={rst_r:.2f}, acks={flow.ack_count}, pkts={total_pkts})"
+            )
 
     def _run_ml(self, key, ts, datapath, src_mac):
         if not self.model: return
         flow = self.flows[key]
         feat_dict = flow.get_features()
         
-        # Build vector
-        vector = np.array([[feat_dict[f] for f in FEATURES]])
-        if self.scaler: vector = self.scaler.transform(vector)
-        
-        # Reshape for CNN (TimeSteps=1 for live)
-        vector = vector.reshape(1, vector.shape[1], 1)
-        
-        score = self.model.predict(vector, verbose=0)[0][0]
+        try:
+            vector = np.array([[feat_dict[f] for f in FEATURES]], dtype=np.float32)
+            if self.scaler: vector = self.scaler.transform(vector)
+            vector = vector.reshape(1, vector.shape[1], 1)
+            score = float(self.model.predict(vector, verbose=0)[0][0])
+        except Exception as e:
+            self.logger.error(f"ML prediction error: {e}")
+            return
+
         flow.last_score = score
+        status = f"{Fore.RED}MITM 🚨" if score > 0.5 else f"{Fore.GREEN}NORMAL ✅"
+        print(
+            f"[{ts}] [{Fore.MAGENTA}ML   {Style.RESET_ALL}] "
+            f"Flow: {flow.src_ip}→{flow.dst_ip} | "
+            f"pkts={flow.s2d_packets + flow.d2s_packets} | "
+            f"score={score:.4f} | {status}"
+        )
         
-        status = f"{Fore.RED}MITM 🚨" if score > 0.7 else f"{Fore.GREEN}NORMAL ✅"
-        print(f"[{ts}] [{Fore.MAGENTA}ML   {Style.RESET_ALL}] Flow: {flow.src_ip}→{flow.dst_ip} | pkts={flow.s2d_packets+flow.d2s_packets} | score={score:.4f} | {status}")
-        
-        if score > 0.85:
+        if score > 0.8:
             flow.is_mitm = True
-            self._trigger_detection("ML DETECT", flow.src_ip, src_mac, datapath, 0, f"Score: {score:.4f}")
+            # Classify exact MITM sub-type from flow-level behavioral signals
+            attack_type, reason = flow.classify_mitm_type()
+            # Stage 2: ML confirmed — now trigger FULL detection with DROP rules
+            self._trigger_detection(attack_type, flow.src_ip, src_mac, datapath, 0, reason)
 
     def _trigger_detection(self, d_type, ip, mac, dp, port, details):
-        if mac in self.blocked_macs: return
+        alert_key = (ip, mac, d_type)
+        if alert_key in self.triggered_alerts: return
+        self.triggered_alerts.add(alert_key)
+        
         ts = datetime.datetime.now().strftime('%H:%M:%S')
         
-        print(Fore.RED + Style.BRIGHT + "\n╔══════════════════════════════════════════════╗")
-        print(Fore.RED + Style.BRIGHT + f"║  🚨 MITM ATTACK DETECTED — {d_type:<18}║")
-        print(Fore.RED + Style.BRIGHT + f"║  Time:      {ts:<33}║")
-        print(Fore.RED + Style.BRIGHT + f"║  Attacker:  {ip:<10} ({mac})  ║")
-        print(Fore.RED + Style.BRIGHT + "║  Switch:    s%d  Port: %-23d║" % (dp.id, port))
-        print(Fore.RED + Style.BRIGHT + "║  ACTION:    MAC+IP blocked — DROP rule installed║")
-        print(Fore.RED + Style.BRIGHT + "╚══════════════════════════════════════════════╝\n")
+        print(Fore.RED + Style.BRIGHT + "\n╔════════════════════════════════════════════════════════════╗")
+        print(Fore.RED + Style.BRIGHT + f"║  🚨 MITM ATTACK DETECTED — {d_type:<36}║")
+        print(Fore.RED + Style.BRIGHT + f"║  Time:     {ts:<47}║")
+        print(Fore.RED + Style.BRIGHT + f"║  Host IP:  {ip:<47}║")
+        print(Fore.RED + Style.BRIGHT + f"║  MAC:      {mac:<47}║")
+        print(Fore.RED + Style.BRIGHT + f"║  Details:  {details:<47}║")
+        print(Fore.RED + Style.BRIGHT + "║  Action:   MAC+IP blocked — DROP rule installed            ║")
+        print(Fore.RED + Style.BRIGHT + "╚════════════════════════════════════════════════════════════╝\n")
         
-        self.detections.append(f"[{ts}] {d_type}  {ip} blocked")
+        self.detections.append(f"[{ts}] {d_type:<22} {ip} blocked")
         self.blocked_macs.add(mac)
         self.blocked_ips.add(ip)
         
-        # Install Block Rule
+        # Install DROP rule on the switch
         parser = dp.ofproto_parser
         match_mac = parser.OFPMatch(eth_src=mac)
-        self.add_flow(dp, 100, match_mac, []) # Drop
+        self.add_flow(dp, 100, match_mac, [])
         match_ip = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip)
-        self.add_flow(dp, 100, match_ip, []) # Drop
+        self.add_flow(dp, 100, match_ip, [])
 
     def _stats_timer(self):
         while True:

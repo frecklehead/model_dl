@@ -10,10 +10,12 @@ build/
 .eggs/
 
 # Virtual environments
+tf-env/
 .venv/
 venv/
 env/
 ENV/
+*.pyc
 
 # Jupyter
 .ipynb_checkpoints/
@@ -37,3 +39,8 @@ ENV/
 .DS_Store
 fix_notebook.py
 fix_notebook.ipynb
+tf-env/
+venv/
+.venv/
+__pycache__/
+*.pyc
