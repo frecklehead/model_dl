@@ -10,7 +10,7 @@ Generates flow-level signatures of SSL stripping:
 Usage (from Mininet CLI):
     device1 python3 /tmp/ssl_strip.py 10.0.0.2
 """
-
+"check"
 import sys, time, os
 
 SERVER_IP = sys.argv[1] if len(sys.argv) > 1 else "10.0.0.2"
