@@ -1,4 +1,3 @@
-```
 # -*- coding: utf-8 -*-
 """
 attacker_mitm.py
@@ -179,353 +178,34 @@ print("✅ Logging to:    {}".format(STOLEN))
 sniff(filter="ip host {} or ip host {}".format(VICTIM_IP, SERVER_IP),
       prn=relay_and_intercept, iface=IFACE, store=False)
 
-```
-```
-#!/usr/bin/env python3
-"""
-victim_traffic.py
-Run this on the VICTIM host (h1).
-Simulates a real user browsing a banking site repeatedly.
-CRITICAL for generating enough traffic for ML detection.
-"""
 
-import requests
-import time
-import random
-import sys
-import os
+# ==============================================================================
+# DETAILED ANALYSIS: SDN-MITM-ATTACKS-RESEARCH VS. YOUR PROJECT
+# ==============================================================================
 
-# Ensure unbuffered output
-sys.stdout.reconfigure(line_buffering=True)
+## 1. What they have done (Detailed)
+The `sdn-mitm-attacks-research` project is an academic study focusing on the implementation and vulnerability analysis of MITM attacks in Software-Defined Networks (SDN). Their key contributions include:
+- **ARP Spoofing Implementation:** They used Scapy (`arp_spoof_attack.py`) to perform bidirectional poisoning between victims and gateways. Their approach includes explicit kernel-level IP forwarding management and graceful ARP restoration.
+- **DNS Hijacking (Advanced):** Unlike typical L2 attacks, they implemented a Layer 7 attack using SDN programmability. 
+    - `hijack_switch.py`: A Ryu controller application that installs OpenFlow rules to intercept UDP port 53 traffic.
+    - `mini_dns.py`: A custom-built minimal DNS server that responds to queries with malicious IPs.
+- **SDN Topology Design:** They created complex Mininet topologies (`topo.py`, `new_topo.py`) featuring multiple subnets and a central Linux router, demonstrating that SDN's centralized control plane does not automatically protect hosts from classic L2/L3 attacks.
+- **Detailed Evidence:** They focused on logging flow table changes (`flows_before.txt` etc.) and capturing packet traces (pcaps) to prove that switches remain "unaware" of the poisoning at the flow level.
 
-# Configuration
-SERVER_IP = "10.0.0.2"
-SERVER_PORT = 8080
-BASE_URL = f"http://{SERVER_IP}:{SERVER_PORT}"
+## 2. How this research can help your project
+- **DNS Hijacking Integration:** You can integrate their DNS redirection logic into your `attacker_mitm.py` to make your attack suite more comprehensive.
+- **Flow Table Analysis:** You can use their method of monitoring OpenFlow rules to extract more features for your Machine Learning models (e.g., matching flow duration or packet counts per flow).
+- **Defense Implementation:** Their research discusses Dynamic ARP Inspection (DAI) and MAC-IP Binding Enforcement, which you could implement in your `my_controller.py` as mitigation strategies.
 
-SESSIONS = [
-    {"user": "alice", "pass": "secret123"},
-    {"user": "bob",   "pass": "password456"},
-    {"user": "admin", "pass": "admin123"},
-]
+## 3. Difference from your project
+- **Objective:** Your project is primarily focused on **ML-based detection and classification** (using Decision Trees and Q-Learning), whereas theirs is focused on **vulnerability demonstration and analysis**.
+- **Attack Sophistication:** Your `attacker_mitm.py` is more feature-rich regarding payload manipulation (SSL stripping, cookie theft, HTTP response injection), while theirs is more focused on network-level redirection (DNS hijacking).
+- **Detection Component:** Your project has a robust detection pipeline (`flow_collector.py`, `evaluate_model.py`) which their research lacks.
 
-def log(msg):
-    ts = time.strftime('%H:%M:%S')
-    print(f"[{ts}] {msg}")
-
-def run_user_session():
-    session = requests.Session()
-    user_creds = random.choice(SESSIONS)
-    username = user_creds['user']
-    
-    try:
-        # 1. Browse Homepage
-        log(f"Victim browsing homepage as {username}...")
-        resp = session.get(f"{BASE_URL}/", timeout=2)
-        if resp.status_code != 200:
-            log(f"⚠️  Error reaching server: {resp.status_code}")
-            return
-
-        time.sleep( random.uniform(0.5, 1.5))
-
-        # 2. Login
-        log(f"Sending POST /login user={username} pass={user_creds['pass']}")
-        login_data = {'username': username, 'password': user_creds['pass']}
-        resp = session.post(f"{BASE_URL}/login", data=login_data, timeout=2)
-        
-        if "Login Successful" in resp.text:
-            log("✅ Login successful")
-        else:
-            log("❌ Login failed (maybe under attack?)")
-
-        time.sleep(random.uniform(0.5, 1.5))
-
-        # 3. View Dashboard
-        log("Viewing dashboard...")
-        session.get(f"{BASE_URL}/dashboard", timeout=2)
-
-        # 4. Transfer Money (sometimes)
-        if random.random() > 0.5:
-            time.sleep(1)
-            amount = random.randint(10, 500)
-            log(f"Transferring ${amount}...")
-            session.post(f"{BASE_URL}/transfer", data={'amount': amount, 'to': 'charity'}, timeout=2)
-
-    except requests.exceptions.ConnectionError:
-        log("❌ Connection Error: Server unreachable (Check if blocked?)")
-    except requests.exceptions.Timeout:
-        log("⚠️  Timeout: Server slow to respond")
-    except Exception as e:
-        log(f"❌ Error: {e}")
-
-if __name__ == "__main__":
-    print(f"Starting simulated victim traffic to {BASE_URL}...")
-    print("Press Ctrl+C to stop.")
-    print("-" * 40)
-    
-    # Wait for server to be ready
-    time.sleep(2)
-    
-    while True:
-        run_user_session()
-        delay = random.uniform(2, 4)
-        log(f"Sleeping {delay:.1f}s...")
-        print("-" * 40)
-        time.sleep(delay)
-
-```
-```
-#!/usr/bin/env python3
-"""
-server_login.py
-Run this on the SERVER host (h2).
-Simulates a real banking login portal.
-"""
-
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs
-import time
-import datetime
-import os
-import sys
-
-# Ensure logs are visible immediately
-sys.stdout.reconfigure(line_buffering=True)
-
-SERVER_PORT = 8080
-LOG_FILE = "/tmp/server_log.txt"
-
-def log_event(msg):
-    ts = datetime.datetime.now().strftime('%H:%M:%S')
-    log_line = f"[{ts}] {msg}"
-    print(log_line)
-    with open(LOG_FILE, 'a') as f:
-        f.write(log_line + "\n")
-
-class BankHandler(BaseHTTPRequestHandler):
-    def _send_html(self, content):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-        self.wfile.write(content.encode('utf-8'))
-
-    def do_GET(self):
-        client_ip = self.client_address[0]
-        
-        if self.path == '/':
-            log_event(f"[HTTP] GET / from {client_ip}")
-            html = """
-            <html>
-            <head><title>SecureBank Login</title></head>
-            <body>
-                <h1>Welcome to SecureBank</h1>
-                <form method='POST' action='/login'>
-                    Username: <input name='username'><br>
-                    Password: <input name='password' type='password'><br>
-                    <input type='submit' value='Login'>
-                </form>
-            </body>
-            </html>
-            """
-            self._send_html(html)
-            
-        elif self.path == '/dashboard':
-            log_event(f"[HTTP] GET /dashboard from {client_ip}")
-            html = "<html><body><h1>Your Account Dashboard</h1><p>Balance: $10,000</p></body></html>"
-            self._send_html(html)
-            
-        else:
-            self.send_error(404)
-
-    def do_POST(self):
-        client_ip = self.client_address[0]
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length).decode('utf-8')
-        params = parse_qs(body)
-
-        if self.path == '/login':
-            user = params.get('username', ['?'])[0]
-            pwd = params.get('password', ['?'])[0]
-            log_event(f"[LOGIN] user={user} pass={pwd} | from={client_ip}")
-            self._send_html("<html><body><h1>Login Successful!</h1><a href='/dashboard'>Go to Dashboard</a></body></html>")
-            
-        elif self.path == '/transfer':
-            amount = params.get('amount', ['0'])[0]
-            to_account = params.get('to', ['?'])[0]
-            log_event(f"[TRANSFER] ${amount} to {to_account} | from={client_ip}")
-            self._send_html("<html><body><h1>Transfer Complete!</h1></body></html>")
-            
-        else:
-            self.send_error(404)
-            
-    def log_message(self, fmt, *args):
-        # Suppress default logging to keep terminal clean
-        pass
-
-class BankServer(HTTPServer):
-    allow_reuse_address = True
-
-if __name__ == '__main__':
-    # Clean previous log
-    if os.path.exists(LOG_FILE):
-        try:
-            os.remove(LOG_FILE)
-        except OSError:
-            pass
-        
-    log_event("Attempting to start server...")
-    
-    try:
-        server = BankServer(('0.0.0.0', SERVER_PORT), BankHandler)
-        print(f"Server started on port {SERVER_PORT}...")
-        log_event("Server started successfully.")
-        server.serve_forever()
-    except OSError as e:
-        if e.errno == 98:
-            print(f"❌ ERROR: Port {SERVER_PORT} is already in use.")
-            print("Try killing the existing process with: fuser -k 8080/tcp")
-            log_event(f"Error: Port {SERVER_PORT} in use.")
-        else:
-            print(f"❌ ERROR: {e}")
-            log_event(f"Error: {e}")
-    except KeyboardInterrupt:
-        print("\nServer stopping...")
-        if 'server' in locals():
-            server.server_close()
-
-```
-```
-#!/usr/bin/env python3
-"""
-run_demo.py — Complete MITM Detection Demo
-Starts everything automatically in Mininet.
-
-Usage: sudo python3 run_demo.py
-
-What it does:
-  1. Creates topology
-  2. Starts Ryu controller (assumes already running)
-  3. Starts server (login page)
-  4. Starts victim (sends credentials)
-  5. Starts attacker (MITM)
-  6. Watches Ryu detect and block the attack
-"""
-
-from mininet.net import Mininet
-from mininet.node import RemoteController, OVSSwitch
-from mininet.cli import CLI
-from mininet.log import setLogLevel
-import time
-import os
-
-def create_topology():
-    net = Mininet(controller=RemoteController, switch=OVSSwitch)
-
-    c0 = net.addController('c0', ip='127.0.0.1', port=6633)
-
-    # Single Switch for 100% reliable demo connectivity
-    s1 = net.addSwitch('s1', protocols='OpenFlow13')
-
-    # All hosts on the same switch
-    victim   = net.addHost('victim',   ip='10.0.0.1/24', mac='00:00:00:00:00:01')
-    server   = net.addHost('server',   ip='10.0.0.2/24', mac='00:00:00:00:00:02')
-    attacker = net.addHost('attacker', ip='10.0.0.100/24', mac='00:00:00:00:00:03')
-    
-    device1  = net.addHost('device1',  ip='10.0.0.11/24', mac='00:00:00:00:00:11')
-    device2  = net.addHost('device2',  ip='10.0.0.12/24', mac='00:00:00:00:00:12')
-
-    # Links
-    net.addLink(victim,   s1)
-    net.addLink(server,   s1)
-    net.addLink(attacker, s1)
-    net.addLink(device1,  s1)
-    net.addLink(device2,  s1)
-
-    return net
-
-def run_demo():
-    net = create_topology()
-    net.start()
-
-    victim   = net.get('victim')
-    server   = net.get('server')
-    attacker = net.get('attacker')
-    device1  = net.get('device1')
-
-    print("\n" + "="*60)
-    print("🚀 MITM DETECTION DEMO STARTED")
-    print("="*60)
-
-    # ── Phase 1: Test connectivity ─────────────────────────
-    print("\n📡 Phase 1: Testing network connectivity...")
-    time.sleep(2) # Wait for Ryu to learn ports
-    print("Pinging all hosts to warm up the controller...")
-    net.pingAll()
-    
-    result = victim.cmd('ping -c 2 10.0.0.2')
-    if "2 received" in result:
-        print("✅ Victim can reach Server — network OK")
-    else:
-        print("⚠️  Connectivity issue — check Ryu controller logs")
-
-    # ── Phase 2: Start server (login page) ────────────────
-    print("\n🏦 Phase 2: Starting login server...")
-    server.cmd('python3 /tmp/server_login.py &')
-    time.sleep(2)
-    print("✅ Login server running on 10.0.0.2:8080")
-
-    # ── Phase 3: Generate normal traffic ──────────────────
-    print("\n✅ Phase 3: Normal traffic (no attack)...")
-    victim.cmd('curl -s http://10.0.0.2:8080/ > /dev/null &')
-    victim.cmd('curl -s -X POST http://10.0.0.2:8080/login -d "username=alice&password=secret123" &')
-    device1.cmd('ping -c 10 10.0.0.2 &')
-    time.sleep(5)
-    print("✅ Normal traffic generated — Ryu should show 'Normal' scores")
-
-    # ── Phase 4: Launch MITM attack ────────────────────────
-    print("\n🔴 Phase 4: Launching REAL MITM Attack...")
-    print("   Step 1: Enabling IP forwarding on attacker...")
-    attacker.cmd('sysctl -w net.ipv4.ip_forward=1')
-
-    print("   Step 2: ARP poisoning victim and server...")
-    attacker.cmd('python3 /tmp/attacker_mitm.py 10.0.0.1 10.0.0.2 &')
-    time.sleep(3)
-    print("✅ Attack launched! Traffic now flows through attacker")
-
-    # ── Phase 5: Victim sends credentials (gets stolen!) ──
-    print("\n💀 Phase 5: Victim sending credentials (being stolen!)...")
-    victim.cmd('python3 /tmp/victim_traffic.py 10.0.0.2 &')
-    time.sleep(5)
-
-    # ── Phase 6: Check stolen credentials ─────────────────
-    print("\n🔍 Phase 6: Checking attacker's stolen data...")
-    stolen = attacker.cmd('cat /tmp/mitm_stolen.txt 2>/dev/null || echo "No file yet"')
-    if "username" in stolen or "password" in stolen:
-        print("🚨 CREDENTIALS STOLEN BY ATTACKER:")
-        print(stolen[:300])
-    else:
-        print("⏳ Attack in progress... check attacker terminal")
-
-    # ── Phase 7: Verify detection ─────────────────────────
-    print("\n🛡️  Phase 7: Verifying detection...")
-    print("   → Check Ryu controller terminal for:")
-    print("     🚨 [RULE] ARP SPOOF DETECTED!")
-    print("     🚨 [ML]   MITM DETECTED!")
-    print("     🔒 Blocked MAC/IP of attacker")
-
-    print("\n" + "="*60)
-    print("📊 DEMO COMPLETE — Opening interactive CLI")
-    print("   Useful CLI commands:")
-    print("   victim arp -n          → see poisoned ARP table")
-    print("   attacker cat /tmp/mitm_stolen.txt  → stolen creds")
-    print("   server  cat /tmp/server_log.txt    → server logs")
-    print("="*60 + "\n")
-
-    CLI(net)
-    net.stop()
-
-if __name__ == '__main__':
-    setLogLevel('info')
-    run_demo()
-
-```
+## 4. Evaluation Measures (Based on RL.ipynb Analysis)
+Looking at your `RL.ipynb`, the following measures should be applied to improve your model evaluation:
+- **Train/Test Separation:** Currently, the RL evaluation often happens on the same data it learned from. Implement a strict split to test the agent's generalization to unseen traffic patterns.
+- **Confusion Matrix & F1-Score:** Accuracy is misleading for security data (which is often imbalanced). You must track **Precision** (avoiding false alarms) and **Recall** (detecting all attacks).
+- **Detection Latency:** Measure the time from the start of an attack flow to the moment the RL agent classifies it as "Malicious." In a real SDN, delay is critical.
+- **False Positive Rate (FPR):** Specifically monitor how often benign user traffic (like your `victim_traffic.py`) is incorrectly blocked.
+- **Convergence Monitoring:** Instead of just final accuracy, plot the **Cumulative Reward** or **Temporal Difference (TD) Error** to ensure the Q-Learning agent is actually converging to an optimal policy.
