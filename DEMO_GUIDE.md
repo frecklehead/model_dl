@@ -10,9 +10,11 @@ Prepare 5 terminal windows for a professional look:
 2. **Terminal 2: Mininet CLI**
 3. **Terminal 3: Victim (h1) Traffic**
 4. **Terminal 4: Attacker (h3) Output**
-5. **Terminal 5: Live Stolen Data Monitor**
 
+5. **Terminal 5: Live Stolen Data Monitor**
+docker exec -it /ryu-mitm /bin/bash
 ---
+
 
 ## STEP 1: PREPARATION & NORMAL TRAFFIC
 
