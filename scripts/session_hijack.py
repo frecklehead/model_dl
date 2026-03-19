@@ -13,7 +13,7 @@ Uses Scapy for raw packet injection.
 Usage (from Mininet CLI):
     device2 python3 /tmp/session_hijack.py 10.0.0.1 10.0.0.2
 """
-
+"try"
 import sys, time, os
 from scapy.all import *
 
