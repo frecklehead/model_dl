@@ -344,7 +344,7 @@ def main():
     
     # Predictions
     y_pred_prob = model.predict(X_test_cnn)
-    y_pred = (y_pred_prob > 0.7).astype(int)  # Threshold 0.7 as requested
+    y_pred = (y_pred_prob > 0.5).astype(int)  # Standard 0.5 threshold for published metrics
     
     print("Classification Report:")
     print(classification_report(y_test, y_pred, target_names=['Normal', 'MITM']))
