@@ -298,11 +298,9 @@ class MITMController(app_manager.RyuApp):
     def _state_change_handler(self, ev):
         datapath = ev.datapath
         if ev.state == MAIN_DISPATCHER:
-            if datapath.id not in self.datapaths:
-                self.datapaths[datapath.id] = datapath
+            self.datapaths[datapath.id] = datapath
         elif ev.state == DEAD_DISPATCHER:
-            if datapath.id in self.datapaths:
-                del self.datapaths[datapath.id]
+            self.datapaths.pop(datapath.id, None)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -310,7 +308,11 @@ class MITMController(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # Clear state when switch connects (for demo consistency)
+        # Register the datapath here too — EventOFPStateChange is unreliable
+        # in some Ryu forks so we populate datapaths from both handlers.
+        self.datapaths[datapath.id] = datapath
+
+        # Clear per-datapath state only; leave other switches' data intact
         self.mac_to_port.pop(datapath.id, None)
         self.arp_table.clear()
         self.flows.clear()
@@ -318,13 +320,19 @@ class MITMController(app_manager.RyuApp):
         self.blocked_ips.clear()
         self.detections.clear()
         self.triggered_alerts.clear()
-        
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Switch {datapath.id} connected. State Reset.")
 
-        # Install table-miss flow entry
+        ts = datetime.datetime.now().strftime('%H:%M:%S')
+        print(Fore.GREEN + Style.BRIGHT +
+              f"[{ts}] *** Switch connected: dpid={datapath.id} "
+              f"(total={len(self.datapaths)}) ***")
+
+        # Install table-miss: send ALL unmatched packets to controller.
+        # Without this rule OVS drops unknown packets and Ryu never sees them.
         match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                          ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
+        print(f"[{ts}]   Table-miss flow installed on dpid={datapath.id}")
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
@@ -390,18 +398,24 @@ class MITMController(app_manager.RyuApp):
 
     def _handle_arp(self, datapath, in_port, pkt_arp, eth, ts):
         opcode = "REQUEST" if pkt_arp.opcode == arp.ARP_REQUEST else "REPLY"
-        print(f"[{ts}] [{Fore.YELLOW}ARP  {Style.RESET_ALL}] {opcode:<8} {pkt_arp.src_ip} ({eth.src}) → {pkt_arp.dst_ip}")
-        
-        src_ip, src_mac = pkt_arp.src_ip, eth.src
+        src_ip  = pkt_arp.src_ip
+        src_mac = eth.src
+        print(f"[{ts}] [{Fore.YELLOW}ARP  {Style.RESET_ALL}] "
+              f"{opcode:<8} {src_ip} ({src_mac}) -> {pkt_arp.dst_ip} | "
+              f"switch={datapath.id} port={in_port}")
+
         if src_ip in self.arp_table:
-            if self.arp_table[src_ip] != src_mac:
-                known = self.arp_table[src_ip]
+            known = self.arp_table[src_ip]
+            if known != src_mac:
+                # Different MAC claiming same IP → ARP spoofing
                 self._trigger_detection(
                     "ARP POISONING", src_ip, src_mac, datapath, in_port,
-                    f"IP {src_ip} was bound to {known}, now claiming {src_mac}"
+                    f"IP {src_ip} known-MAC={known} fake-MAC={src_mac}"
                 )
+                return   # do not update table with the forged MAC
         else:
             self.arp_table[src_ip] = src_mac
+            print(f"[{ts}]   [ARP] Recorded: {src_ip} -> {src_mac}")
 
     def _handle_ipv4(self, datapath, in_port, pkt, pkt_ipv4, eth, ts):
         src_ip = pkt_ipv4.src
@@ -440,12 +454,12 @@ class MITMController(app_manager.RyuApp):
         flow = self.flows[key]
         total_p = flow.s2d_packets + flow.d2s_packets
         
-        # Rule-based detection (runs independently of ML model)
-        if total_p >= 20 and total_p % 10 == 0:
+        # Rule-based detection: check every 5 packets once we have enough data
+        if total_p >= 5 and total_p % 5 == 0:
             self._check_flow_rules(flow, ts, datapath, eth.src)
-        
-        # ML Analysis every 20 packets
-        if total_p % 20 == 0:
+
+        # ML analysis: run every 10 packets (more responsive for demo)
+        if total_p >= 5 and total_p % 10 == 0:
             self._run_ml(key, ts, datapath, eth.src)
 
     def _check_flow_rules(self, flow, ts, datapath, src_mac):
