@@ -38,6 +38,10 @@ WORKDIR /app
 # Create necessary directories for the controller
 RUN mkdir -p model plots scripts
 
+# Copy controller and model files
+COPY my_controller.py /app/my_controller.py
+COPY model/ /app/model/
+
 # Expose OpenFlow (6633) and HTTP (8080) ports
 EXPOSE 6633 8080
 
