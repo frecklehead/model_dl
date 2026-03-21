@@ -97,14 +97,21 @@ def create_topology():
     return net, r0
 
 def deploy_scripts():
-    print("\n📂 Deploying attack scripts ...")
-    for fname in ['attacker_mitm.py', 'victim_traffic.py', 'server_login.py', 'ssl_strip.py', 'session_hijack.py']:
+    """Copy scripts/ → /tmp/ (all Mininet hosts share the root filesystem)."""
+    print("\n📂 Deploying scripts to /tmp ...")
+    for fname in ['attacker_mitm.py', 'victim_traffic.py', 'server_login.py',
+                  'ssl_strip.py', 'session_hijack.py']:
         src = os.path.join(SCRIPTS_DIR, fname)
         dst = f'/tmp/{fname}'
         if os.path.exists(src):
+            # Remove stale copy first (may be owned by a previous sudo run)
+            if os.path.exists(dst):
+                os.remove(dst)
             shutil.copy2(src, dst)
             os.chmod(dst, 0o755)
-            print(f"  ✅ {fname}")
+            print(f"  ✅ /tmp/{fname}")
+        else:
+            print(f"  ❌ NOT FOUND: {src}")
 
 def _ovs_get(field, target='s1'):
     r = subprocess.run(['ovs-vsctl', 'get', 'controller', target, field], capture_output=True, text=True)
