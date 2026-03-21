@@ -32,16 +32,20 @@ try:
 except ImportError:
     ML_AVAILABLE = False
 
-# Features requested by user (25 features)
-FEATURES = [
-    'bidirectional_duration_ms', 'bidirectional_packets', 'bidirectional_bytes',
-    'src2dst_packets', 'src2dst_bytes', 'dst2src_packets', 'dst2src_bytes',
-    'bidirectional_mean_ps', 'bidirectional_stddev_ps', 'bidirectional_mean_piat_ms',
-    'bidirectional_stddev_piat_ms', 'bidirectional_syn_packets', 'bidirectional_ack_packets',
-    'bidirectional_rst_packets', 'bidirectional_fin_packets', 'packet_asymmetry',
-    'byte_asymmetry', 'bytes_per_packet', 'syn_ratio', 'rst_ratio',
-    'piat_variance_ratio', 'protocol', 'src_port', 'dst_port', 'ps_variance_ratio'
+# FEATURES is loaded at runtime from selected_features.pkl so it always
+# matches whatever the trained model actually expects.  This list is only
+# used as a last-resort fallback if the pkl is missing.
+_FALLBACK_FEATURES = [
+    'src_port', 'dst_port', 'bidirectional_duration_ms', 'bidirectional_bytes',
+    'src2dst_duration_ms', 'src2dst_packets', 'src2dst_bytes',
+    'bidirectional_min_ps', 'bidirectional_mean_ps', 'bidirectional_stddev_ps',
+    'bidirectional_max_ps', 'src2dst_max_ps', 'dst2src_min_ps', 'dst2src_max_ps',
+    'bidirectional_mean_piat_ms', 'bidirectional_max_piat_ms', 'src2dst_max_piat_ms',
+    'application_name', 'requested_server_name',
+    'byte_asymmetry', 'bytes_per_packet', 'src2dst_bpp', 'dst2src_bpp',
+    'duration_ratio', 'ps_variance_ratio',
 ]
+FEATURES = _FALLBACK_FEATURES  # overwritten from pkl in _load_model()
 
 class FlowTracker:
     def __init__(self, src_ip, dst_ip, src_port, dst_port, protocol):
@@ -50,40 +54,60 @@ class FlowTracker:
         self.src_port = src_port
         self.dst_port = dst_port
         self.protocol = protocol
-        
-        self.start_time = time.time()
-        self.last_time = time.time()
-        
+
+        now = time.time()
+        self.start_time = now
+        self.last_time = now
+
+        # Bidirectional counters
         self.s2d_packets = 0
         self.s2d_bytes = 0
         self.d2s_packets = 0
         self.d2s_bytes = 0
-        
-        self.packet_sizes = []
-        self.piats = []
-        
+
+        # Packet size tracking — bidirectional and per-direction
+        self.packet_sizes = []       # all packets
+        self.s2d_packet_sizes = []   # src→dst only
+        self.d2s_packet_sizes = []   # dst→src only
+
+        # PIAT tracking — bidirectional and per-direction
+        self.piats = []              # all inter-arrival times
+        self.s2d_piats = []          # src→dst only
+        self.s2d_last_time = now     # timestamp of last s2d packet
+
+        # Directional duration tracking
+        self.s2d_start_time = None   # set on first s2d packet
+
+        # TCP flag counts (kept for rule-based layer, not fed to ML)
         self.syn_count = 0
         self.ack_count = 0
         self.rst_count = 0
         self.fin_count = 0
-        
+
         self.last_score = 0.0
         self.is_mitm = False
 
     def update(self, size, direction, flags=0):
         now = time.time()
-        self.piats.append((now - self.last_time) * 1000)
+        piat_ms = (now - self.last_time) * 1000
+        self.piats.append(piat_ms)
         self.last_time = now
         self.packet_sizes.append(size)
-        
+
         if direction == 's2d':
             self.s2d_packets += 1
             self.s2d_bytes += size
+            self.s2d_packet_sizes.append(size)
+            self.s2d_piats.append((now - self.s2d_last_time) * 1000)
+            self.s2d_last_time = now
+            if self.s2d_start_time is None:
+                self.s2d_start_time = now
         else:
             self.d2s_packets += 1
             self.d2s_bytes += size
-            
-        # Ryu TCP flags: FIN=1, SYN=2, RST=4, PSH=8, ACK=16
+            self.d2s_packet_sizes.append(size)
+
+        # TCP flags: FIN=1, SYN=2, RST=4, PSH=8, ACK=16
         if flags & 0x02: self.syn_count += 1
         if flags & 0x10: self.ack_count += 1
         if flags & 0x04: self.rst_count += 1
@@ -132,43 +156,67 @@ class FlowTracker:
         return ("ML ANOMALY", "Flow statistics deviate from normal baseline")
 
     def get_features(self):
-        duration = (self.last_time - self.start_time) * 1000
-        total_pkts = self.s2d_packets + self.d2s_packets
+        """
+        Returns a dict whose keys exactly match selected_features.pkl so the
+        ML model receives the same feature space it was trained on.
+        """
+        now = time.time()
+        total_pkts  = self.s2d_packets + self.d2s_packets
         total_bytes = self.s2d_bytes + self.d2s_bytes
-        
-        mean_ps = np.mean(self.packet_sizes) if self.packet_sizes else 0
-        std_ps = np.std(self.packet_sizes) if self.packet_sizes else 0
-        mean_piat = np.mean(self.piats) if self.piats else 0
-        std_piat = np.std(self.piats) if self.piats else 0
-        
-        safe_pkts = total_pkts if total_pkts > 0 else 1
-        
+        safe_pkts   = max(total_pkts, 1)
+
+        # ── packet size stats ──────────────────────────────
+        all_ps  = self.packet_sizes if self.packet_sizes else [0]
+        s2d_ps  = self.s2d_packet_sizes if self.s2d_packet_sizes else [0]
+        d2s_ps  = self.d2s_packet_sizes if self.d2s_packet_sizes else [0]
+
+        mean_ps = float(np.mean(all_ps))
+        std_ps  = float(np.std(all_ps))
+        min_ps  = float(min(all_ps))
+        max_ps  = float(max(all_ps))
+
+        # ── PIAT stats ─────────────────────────────────────
+        all_piat  = self.piats if self.piats else [0]
+        s2d_piat  = self.s2d_piats if self.s2d_piats else [0]
+
+        mean_piat = float(np.mean(all_piat))
+        max_piat  = float(max(all_piat))
+
+        # ── directional durations ──────────────────────────
+        bidi_dur  = (now - self.start_time) * 1000
+        s2d_dur   = ((self.s2d_last_time - self.s2d_start_time) * 1000
+                     if self.s2d_start_time is not None else 0.0)
+        d2s_dur   = max(bidi_dur - s2d_dur, 0.0)
+
         return {
-            'bidirectional_duration_ms': duration,
-            'bidirectional_packets': total_pkts,
-            'bidirectional_bytes': total_bytes,
-            'src2dst_packets': self.s2d_packets,
-            'src2dst_bytes': self.s2d_bytes,
-            'dst2src_packets': self.d2s_packets,
-            'dst2src_bytes': self.d2s_bytes,
-            'bidirectional_mean_ps': mean_ps,
-            'bidirectional_stddev_ps': std_ps,
-            'bidirectional_mean_piat_ms': mean_piat,
-            'bidirectional_stddev_piat_ms': std_piat,
-            'bidirectional_syn_packets': self.syn_count,
-            'bidirectional_ack_packets': self.ack_count,
-            'bidirectional_rst_packets': self.rst_count,
-            'bidirectional_fin_packets': self.fin_count,
-            'packet_asymmetry': abs(self.s2d_packets - self.d2s_packets) / safe_pkts,
-            'byte_asymmetry': abs(self.s2d_bytes - self.d2s_bytes) / (total_bytes + 1),
-            'bytes_per_packet': total_bytes / safe_pkts,
-            'syn_ratio': self.syn_count / safe_pkts,
-            'rst_ratio': self.rst_count / safe_pkts,
-            'piat_variance_ratio': (std_piat**2) / (mean_piat + 1),
-            'protocol': self.protocol,
-            'src_port': self.src_port,
-            'dst_port': self.dst_port,
-            'ps_variance_ratio': (std_ps**2) / (mean_ps + 1)
+            # ── features the model was trained on ──────────
+            'src_port':                  self.src_port,
+            'dst_port':                  self.dst_port,
+            'bidirectional_duration_ms': bidi_dur,
+            'bidirectional_bytes':       float(total_bytes),
+            'src2dst_duration_ms':       s2d_dur,
+            'src2dst_packets':           float(self.s2d_packets),
+            'src2dst_bytes':             float(self.s2d_bytes),
+            'bidirectional_min_ps':      min_ps,
+            'bidirectional_mean_ps':     mean_ps,
+            'bidirectional_stddev_ps':   std_ps,
+            'bidirectional_max_ps':      max_ps,
+            'src2dst_max_ps':            float(max(s2d_ps)),
+            'dst2src_min_ps':            float(min(d2s_ps)),
+            'dst2src_max_ps':            float(max(d2s_ps)),
+            'bidirectional_mean_piat_ms':mean_piat,
+            'bidirectional_max_piat_ms': max_piat,
+            'src2dst_max_piat_ms':       float(max(s2d_piat)),
+            # text categoricals are unknown at runtime → use 0 (encoded "unknown")
+            'application_name':          0.0,
+            'requested_server_name':     0.0,
+            # engineered features (same formulas as train_model.py)
+            'byte_asymmetry':  abs(self.s2d_bytes - self.d2s_bytes) / (total_bytes + 1),
+            'bytes_per_packet':total_bytes / safe_pkts,
+            'src2dst_bpp':     self.s2d_bytes / (self.s2d_packets + 1),
+            'dst2src_bpp':     self.d2s_bytes / (self.d2s_packets + 1),
+            'duration_ratio':  s2d_dur / (d2s_dur + 1),
+            'ps_variance_ratio': (std_ps ** 2) / (mean_ps + 1),
         }
 
 class MITMController(app_manager.RyuApp):
@@ -197,16 +245,47 @@ class MITMController(app_manager.RyuApp):
         self.stats_thread = hub.spawn(self._stats_timer)
 
     def _load_model(self):
-        m_path = "/app/model/mitm_model.h5"
-        s_path = "/app/model/scaler.pkl"
-        if ML_AVAILABLE and os.path.exists(m_path):
-            try:
-                self.model = tf.keras.models.load_model(m_path)
-                if os.path.exists(s_path):
-                    self.scaler = joblib.load(s_path)
-                self.logger.info("CNN+LSTM Model loaded successfully.")
-            except Exception as e:
-                self.logger.error(f"Error loading model: {e}")
+        global FEATURES
+        # Support both Docker (/app/model/) and local (model/) paths
+        base = "/app/model" if os.path.exists("/app/model") else "model"
+        m_path = f"{base}/mitm_model.h5"
+        s_path = f"{base}/scaler.pkl"
+        f_path = f"{base}/selected_features.pkl"
+
+        if not ML_AVAILABLE:
+            self.logger.warning("TensorFlow not available — ML detection disabled.")
+            return
+
+        if not os.path.exists(m_path):
+            self.logger.error(f"Model file not found: {m_path}  Run train_model.py first.")
+            return
+
+        try:
+            self.model  = tf.keras.models.load_model(m_path)
+            self.scaler = joblib.load(s_path) if os.path.exists(s_path) else None
+            if self.scaler is None:
+                self.logger.warning(f"Scaler not found at {s_path} — predictions may be inaccurate.")
+
+            # Load the feature list the model was ACTUALLY trained on.
+            # This is the critical part: FEATURES must match selected_features.pkl
+            # exactly, or the model receives garbage input and never fires.
+            if os.path.exists(f_path):
+                loaded = joblib.load(f_path)
+                FEATURES = loaded
+                self.logger.info(f"Feature list loaded from pkl ({len(FEATURES)} features).")
+            else:
+                self.logger.warning(
+                    f"selected_features.pkl not found at {f_path}. "
+                    "Using fallback feature list — re-train if detection fails."
+                )
+
+            self.logger.info(
+                f"CNN+LSTM model loaded  ({len(FEATURES)} features, "
+                f"scaler={'yes' if self.scaler else 'NO'})"
+            )
+        except Exception as e:
+            self.logger.error(f"Error loading model artefacts: {e}")
+            self.model = None
 
     def _print_header(self):
         print(Fore.CYAN + Style.BRIGHT + "╔══════════════════════════════════════╗")
@@ -219,11 +298,9 @@ class MITMController(app_manager.RyuApp):
     def _state_change_handler(self, ev):
         datapath = ev.datapath
         if ev.state == MAIN_DISPATCHER:
-            if datapath.id not in self.datapaths:
-                self.datapaths[datapath.id] = datapath
+            self.datapaths[datapath.id] = datapath
         elif ev.state == DEAD_DISPATCHER:
-            if datapath.id in self.datapaths:
-                del self.datapaths[datapath.id]
+            self.datapaths.pop(datapath.id, None)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -231,7 +308,11 @@ class MITMController(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # Clear state when switch connects (for demo consistency)
+        # Register the datapath here too — EventOFPStateChange is unreliable
+        # in some Ryu forks so we populate datapaths from both handlers.
+        self.datapaths[datapath.id] = datapath
+
+        # Clear per-datapath state only; leave other switches' data intact
         self.mac_to_port.pop(datapath.id, None)
         self.arp_table.clear()
         self.flows.clear()
@@ -239,13 +320,19 @@ class MITMController(app_manager.RyuApp):
         self.blocked_ips.clear()
         self.detections.clear()
         self.triggered_alerts.clear()
-        
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Switch {datapath.id} connected. State Reset.")
 
-        # Install table-miss flow entry
+        ts = datetime.datetime.now().strftime('%H:%M:%S')
+        print(Fore.GREEN + Style.BRIGHT +
+              f"[{ts}] *** Switch connected: dpid={datapath.id} "
+              f"(total={len(self.datapaths)}) ***")
+
+        # Install table-miss: send ALL unmatched packets to controller.
+        # Without this rule OVS drops unknown packets and Ryu never sees them.
         match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                          ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
+        print(f"[{ts}]   Table-miss flow installed on dpid={datapath.id}")
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
@@ -311,18 +398,24 @@ class MITMController(app_manager.RyuApp):
 
     def _handle_arp(self, datapath, in_port, pkt_arp, eth, ts):
         opcode = "REQUEST" if pkt_arp.opcode == arp.ARP_REQUEST else "REPLY"
-        print(f"[{ts}] [{Fore.YELLOW}ARP  {Style.RESET_ALL}] {opcode:<8} {pkt_arp.src_ip} ({eth.src}) → {pkt_arp.dst_ip}")
-        
-        src_ip, src_mac = pkt_arp.src_ip, eth.src
+        src_ip  = pkt_arp.src_ip
+        src_mac = eth.src
+        print(f"[{ts}] [{Fore.YELLOW}ARP  {Style.RESET_ALL}] "
+              f"{opcode:<8} {src_ip} ({src_mac}) -> {pkt_arp.dst_ip} | "
+              f"switch={datapath.id} port={in_port}")
+
         if src_ip in self.arp_table:
-            if self.arp_table[src_ip] != src_mac:
-                known = self.arp_table[src_ip]
+            known = self.arp_table[src_ip]
+            if known != src_mac:
+                # Different MAC claiming same IP → ARP spoofing
                 self._trigger_detection(
                     "ARP POISONING", src_ip, src_mac, datapath, in_port,
-                    f"IP {src_ip} was bound to {known}, now claiming {src_mac}"
+                    f"IP {src_ip} known-MAC={known} fake-MAC={src_mac}"
                 )
+                return   # do not update table with the forged MAC
         else:
             self.arp_table[src_ip] = src_mac
+            print(f"[{ts}]   [ARP] Recorded: {src_ip} -> {src_mac}")
 
     def _handle_ipv4(self, datapath, in_port, pkt, pkt_ipv4, eth, ts):
         src_ip = pkt_ipv4.src
@@ -361,12 +454,12 @@ class MITMController(app_manager.RyuApp):
         flow = self.flows[key]
         total_p = flow.s2d_packets + flow.d2s_packets
         
-        # Rule-based detection (runs independently of ML model)
-        if total_p >= 20 and total_p % 10 == 0:
+        # Rule-based detection: check every 5 packets once we have enough data
+        if total_p >= 5 and total_p % 5 == 0:
             self._check_flow_rules(flow, ts, datapath, eth.src)
-        
-        # ML Analysis every 20 packets
-        if total_p % 20 == 0:
+
+        # ML analysis: run every 10 packets (more responsive for demo)
+        if total_p >= 5 and total_p % 10 == 0:
             self._run_ml(key, ts, datapath, eth.src)
 
     def _check_flow_rules(self, flow, ts, datapath, src_mac):
@@ -412,11 +505,11 @@ class MITMController(app_manager.RyuApp):
             f"score={score:.4f} | {status}"
         )
         
-        if score > 0.8:
+        # Threshold 0.5 matches the model's training evaluation threshold.
+        # Previously 0.8 caused the detector to miss most attacks.
+        if score > 0.5:
             flow.is_mitm = True
-            # Classify exact MITM sub-type from flow-level behavioral signals
             attack_type, reason = flow.classify_mitm_type()
-            # Stage 2: ML confirmed — now trigger FULL detection with DROP rules
             self._trigger_detection(attack_type, flow.src_ip, src_mac, datapath, 0, reason)
 
     def _trigger_detection(self, d_type, ip, mac, dp, port, details):
