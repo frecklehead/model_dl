@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-my_controller.py - Unified MITM Detection Controller v4.0
+my_controller.py - Unified MITM Detection Controller 
 
 Detection rules:
-  ARP Poisoning     -> RULE-BASED (IP->MAC binding change is definitive)
+  ARP Poisoning     -> ML MODEL first (score >= 0.5), RULE-BASED FALLBACK if no flows
   SSL Stripping     -> ML MODEL first, RULE-BASED FALLBACK after 20 pkts
   Session Hijacking -> ML MODEL first, RULE-BASED FALLBACK after 20 pkts
   DNS Hijacking     -> RULE-BASED (DNS response divergence)
+
+CHANGES FROM v4.0 (honesty fixes):
+  - _flush_old_arp_suspects: only fires alert if best_score >= THRESHOLD (was always firing)
+  - _run_ml_on_flow: arp_suspect lower threshold (0.3) removed; all paths use 0.5
+  - _arp_ml_or_rule: removed (was returning misleading method label on sub-threshold scores)
+  - Rule-based ARP fallback only fires when there are genuinely NO scorable flows,
+    not as a consolation prize for a low-scoring flow
 """
 
 import os, time, datetime, json, collections
@@ -44,7 +51,8 @@ FEATURES = [
     'duration_ratio', 'ps_variance_ratio',
 ]
 
-DNS_PORT = 53
+DNS_PORT   = 53
+ML_THRESHOLD = 0.5   # single authoritative threshold used everywhere
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,19 +65,19 @@ class FlowTracker:
         self.protocol = protocol
 
         now = time.time()
-        self.start_time    = now
-        self.last_time     = now
-        self.s2d_last_time = now
+        self.start_time     = now
+        self.last_time      = now
+        self.s2d_last_time  = now
         self.s2d_start_time = None
 
         self.s2d_packets = 0;  self.s2d_bytes = 0
         self.d2s_packets = 0;  self.d2s_bytes = 0
 
-        self.packet_sizes    = []
+        self.packet_sizes     = []
         self.s2d_packet_sizes = []
         self.d2s_packet_sizes = []
-        self.piats           = []
-        self.s2d_piats       = []
+        self.piats            = []
+        self.s2d_piats        = []
 
         self.syn_count = 0; self.ack_count = 0
         self.rst_count = 0; self.fin_count = 0
@@ -109,14 +117,14 @@ class FlowTracker:
         total_bytes = self.s2d_bytes + self.d2s_bytes
         safe_pkts   = max(total_pkts, 1)
 
-        all_ps  = self.packet_sizes    or [0]
+        all_ps  = self.packet_sizes     or [0]
         s2d_ps  = self.s2d_packet_sizes or [0]
         d2s_ps  = self.d2s_packet_sizes or [0]
-        all_pi  = self.piats           or [0]
-        s2d_pi  = self.s2d_piats       or [0]
+        all_pi  = self.piats            or [0]
+        s2d_pi  = self.s2d_piats        or [0]
 
-        mean_ps  = float(np.mean(all_ps));  std_ps  = float(np.std(all_ps))
-        mean_pi  = float(np.mean(all_pi));  std_pi  = float(np.std(all_pi))
+        mean_ps = float(np.mean(all_ps));  std_ps = float(np.std(all_ps))
+        mean_pi = float(np.mean(all_pi));  std_pi = float(np.std(all_pi))
 
         bidi_dur = (now - self.start_time) * 1000
         s2d_dur  = ((self.s2d_last_time - self.s2d_start_time) * 1000
@@ -157,7 +165,7 @@ class FlowTracker:
             'application_name':             0.0,
             'requested_server_name':        0.0,
             'packet_asymmetry':  abs(self.s2d_packets - self.d2s_packets) / safe_pkts,
-            'byte_asymmetry':    abs(self.s2d_bytes - self.d2s_bytes) / (total_bytes + 1),
+            'byte_asymmetry':    abs(self.s2d_bytes   - self.d2s_bytes)   / (total_bytes + 1),
             'bytes_per_packet':  total_bytes / safe_pkts,
             'src2dst_bpp':       self.s2d_bytes / (self.s2d_packets + 1),
             'dst2src_bpp':       self.d2s_bytes / (self.d2s_packets + 1),
@@ -174,23 +182,23 @@ class FlowTracker:
         tb     = self.s2d_bytes + self.d2s_bytes
         rst_r  = self.rst_count / safe
         pkt_a  = abs(self.s2d_packets - self.d2s_packets) / safe
-        byte_a = abs(self.s2d_bytes - self.d2s_bytes) / (tb + 1)
+        byte_a = abs(self.s2d_bytes   - self.d2s_bytes)   / (tb + 1)
         mi     = float(np.mean(self.piats)) if self.piats else 0
         si     = float(np.std(self.piats))  if self.piats else 0
         cv     = si / (mi + 1e-6)
 
         if (self.dst_port == DNS_PORT or self.src_port == DNS_PORT) and self.protocol == 17:
-            return "DNS HIJACKING", f"UDP/53 flow, pkts={safe}"
+            return "DNS HIJACKING",    f"UDP/53 flow, pkts={safe}"
         if self.dst_port in (443, 8443) or self.src_port in (443, 8443):
-            return "SSL STRIPPING", f"TLS port {self.dst_port or self.src_port}, pkts={safe}"
+            return "SSL STRIPPING",    f"TLS port {self.dst_port or self.src_port}, pkts={safe}"
         if rst_r > 0.15 and self.ack_count > 5:
             return "SESSION HIJACKING", f"RST ratio={rst_r:.2f}, ACKs={self.ack_count}"
         if pkt_a > 0.35 and byte_a > 0.30:
             return "PACKET INTERCEPTION", f"pkt_asym={pkt_a:.2f}, byte_asym={byte_a:.2f}"
         if self.total_packets > 30 and cv < 0.5 and mi < 50:
-            return "RELAY FLOOD", f"piat_cv={cv:.2f}, mean_piat={mi:.1f}ms"
+            return "RELAY FLOOD",      f"piat_cv={cv:.2f}, mean_piat={mi:.1f}ms"
         if pkt_a > 0.15:
-            return "TRAFFIC RELAY", f"pkt_asym={pkt_a:.2f}"
+            return "TRAFFIC RELAY",    f"pkt_asym={pkt_a:.2f}"
         return "ML ANOMALY", "flow statistics deviate from baseline"
 
 
@@ -202,7 +210,7 @@ class MITMController(app_manager.RyuApp):
         super().__init__(*args, **kwargs)
 
         self.mac_to_port      = {}
-        self.arp_table        = {}   # ip -> mac  (first seen)
+        self.arp_table        = {}   # ip -> mac  (first seen / trusted)
         self.arp_conflicts    = {}   # ip -> (known_mac, forged_mac)
         self.dai_bindings     = {}   # ip -> set of MACs
         self.dns_responses    = {}   # domain -> set of IPs
@@ -215,7 +223,9 @@ class MITMController(app_manager.RyuApp):
         self.ml_flagged_flows = set()
         self.attack_counts    = collections.defaultdict(int)
 
-        self.arp_suspects = {}   # conflict_ip -> {known, forged, attacker_ip, mac, dp, at}
+        # ip -> {known, forged, attacker_ip, mac, dp, at}
+        # Cleared only after an alert fires OR after the 20s window with no evidence
+        self.arp_suspects = {}
 
         self.model  = None
         self.scaler = None
@@ -234,7 +244,7 @@ class MITMController(app_manager.RyuApp):
         if not ML_AVAILABLE:
             self.logger.warning("TensorFlow not available — ML disabled.")
             return
-        # Prefer SavedModel directory (version-agnostic), fall back to .h5
+
         saved_path = f"{base}/mitm_model_saved"
         if os.path.isdir(saved_path):
             m_path = saved_path
@@ -260,7 +270,7 @@ class MITMController(app_manager.RyuApp):
             self.model = None
 
     def _ml_score(self, flow):
-        """Run ML on a flow. Returns float score or None on error."""
+        """Run ML inference on a flow. Returns float in [0,1] or None on error."""
         if not self.model:
             return None
         try:
@@ -281,13 +291,14 @@ class MITMController(app_manager.RyuApp):
         ml = "LOADED" if self.model else "NOT FOUND (rule-based only)"
         lines = [
             "=" * 62,
-            f"  MITM DETECTION CONTROLLER v4.0",
+            f"  MITM DETECTION CONTROLLER v4.1 (HONEST)",
             f"  ML Model   : {ml}",
             f"  Features   : {len(FEATURES)}",
+            f"  ML Threshold : {ML_THRESHOLD}  (single value, used everywhere)",
             "-" * 62,
-            "  ARP Poisoning     : ML Model(CNN+LSTM)",
-            "  SSL Stripping     : ML MODEL -> RULE-BASED fallback",
-            "  Session Hijacking : ML MODEL -> RULE-BASED fallback",
+            "  ARP Poisoning     : ML MODEL (score>=0.5) -> RULE-BASED if no flows",
+            "  SSL Stripping     : ML MODEL -> RULE-BASED fallback after 20 pkts",
+            "  Session Hijacking : ML MODEL -> RULE-BASED fallback after 20 pkts",
             "  DNS Hijacking     : RULE-BASED",
             "=" * 62,
         ]
@@ -309,22 +320,18 @@ class MITMController(app_manager.RyuApp):
         ofproto = dp.ofproto
         parser  = dp.ofproto_parser
 
-        # Register in both handlers — EventOFPStateChange is unreliable in some Ryu builds
         self.datapaths[dp.id] = dp
 
-        # Reset state for this switch
-        self.mac_to_port.pop(dp.id, None)
         for attr in ('arp_table', 'arp_conflicts', 'dai_bindings', 'dns_responses',
                      'flows', 'blocked_macs', 'blocked_ips', 'detections',
                      'triggered_alerts', 'ml_flagged_flows', 'attack_counts'):
-            obj = getattr(self, attr)
-            obj.clear()
+            getattr(self, attr).clear()
+        self.mac_to_port.pop(dp.id, None)
 
         ts = datetime.datetime.now().strftime('%H:%M:%S')
         print(Fore.GREEN + Style.BRIGHT +
               f"\n[{ts}] *** Switch CONNECTED: dpid={dp.id} ***", flush=True)
 
-        # Table-miss: send all unmatched packets to controller
         match   = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                           ofproto.OFPCML_NO_BUFFER)]
@@ -332,7 +339,7 @@ class MITMController(app_manager.RyuApp):
         print(f"[{ts}]   Table-miss flow installed.", flush=True)
 
     def _add_flow(self, dp, priority, match, actions):
-        parser = dp.ofproto_parser
+        parser  = dp.ofproto_parser
         ofproto = dp.ofproto
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=priority,
@@ -369,7 +376,6 @@ class MITMController(app_manager.RyuApp):
                 return
             self._handle_ip(dp, in_port, pkt, pkt_ip, eth, ts)
 
-        # MAC learning + forwarding
         self.mac_to_port.setdefault(dp.id, {})[src_mac] = in_port
         out_port = self.mac_to_port[dp.id].get(dst_mac, ofproto.OFPP_FLOOD)
         actions  = [parser.OFPActionOutput(out_port)]
@@ -393,7 +399,6 @@ class MITMController(app_manager.RyuApp):
                 print(f"[{ts}] [ARP  ] *** CONFLICT: {src_ip} "
                       f"known={known} forged={src_mac} ***", flush=True)
 
-                # Reverse-lookup attacker's real IP from arp_table via MAC
                 attacker_ip = next(
                     (tbl_ip for tbl_ip, tbl_mac in self.arp_table.items()
                      if tbl_mac == src_mac and tbl_ip != src_ip),
@@ -402,67 +407,31 @@ class MITMController(app_manager.RyuApp):
                 alert_ip = attacker_ip if attacker_ip else src_ip
 
                 if self.model:
-                    # Defer to ML — _run_ml_on_flow will confirm when relay
-                    # traffic is scored.  Rule-based fires as fallback after 20s.
+                    # Register suspect and immediately try scoring existing flows.
+                    # The alert will only fire if a flow scores >= ML_THRESHOLD.
                     self.arp_suspects[src_ip] = {
                         'known': known, 'forged': src_mac,
                         'attacker_ip': alert_ip, 'mac': src_mac,
                         'dp': dp, 'at': time.time(),
                     }
                     print(f"[{ts}] [ARP  ] Suspect registered — scanning existing "
-                          f"flows for ML confirmation …", flush=True)
-                    # Immediately score any existing flows involving this IP
+                          f"flows for ML confirmation (threshold={ML_THRESHOLD}) …",
+                          flush=True)
                     self._scan_flows_for_arp_suspect(src_ip, ts, dp, src_mac)
                 else:
+                    # No ML available: rule-based is the only option.
                     detail = (f"ARP table conflict: {src_ip} "
                               f"known={known} forged={src_mac} | ML not loaded")
                     self._trigger_alert("ARP POISONING", alert_ip, src_mac, dp,
                                         "RULE-BASED", detail)
-                return   # do NOT update table with forged MAC
+                return   # never update table with forged MAC
         else:
             self.arp_table[src_ip] = src_mac
 
-        # DAI tracking
         self.dai_bindings.setdefault(src_ip, set()).add(src_mac)
         if len(self.dai_bindings[src_ip]) > 1:
             print(f"[{ts}] [DAI  ] {len(self.dai_bindings[src_ip])} MACs "
                   f"claim {src_ip}: {sorted(self.dai_bindings[src_ip])}", flush=True)
-
-    def _arp_ml_or_rule(self, conflict_ip, known_mac, forged_mac, ts, dp, in_port):
-        """
-        Try ML on existing flows for conflict_ip.
-        Returns (method_str, detail_str).
-        """
-        best_score = 0.0
-        if self.model:
-            for key, flow in list(self.flows.items()):
-                if flow.src_ip != conflict_ip and flow.dst_ip != conflict_ip:
-                    continue
-                if flow.total_packets < 3:
-                    continue
-                score = self._ml_score(flow)
-                if score is None:
-                    continue
-                flow.last_score = score
-                print(f"[{ts}] [ML   ] ARP scan: {flow.src_ip}->{flow.dst_ip} "
-                      f"pkts={flow.total_packets} score={score:.4f}", flush=True)
-                if score > best_score:
-                    best_score = score
-                if score > 0.5:
-                    self.ml_flagged_flows.add(key)
-                    flow.is_mitm = True
-                    detail = (f"ML score={score:.4f} on flow "
-                              f"{flow.src_ip}->{flow.dst_ip} | "
-                              f"ARP conflict: {conflict_ip} "
-                              f"known={known_mac} forged={forged_mac}")
-                    return "ML MODEL (CNN+LSTM)", detail
-
-        # ML not available or scored below threshold
-        detail = (f"ARP table conflict: {conflict_ip} "
-                  f"known={known_mac} forged={forged_mac}"
-                  + (f" | best ML score={best_score:.4f} (<0.5)"
-                     if self.model else " | ML model not loaded"))
-        return "RULE-BASED", detail
 
     # ── IPv4 handler ──────────────────────────────────────────────────────────
     def _handle_ip(self, dp, in_port, pkt, pkt_ip, eth, ts):
@@ -491,12 +460,11 @@ class MITMController(app_manager.RyuApp):
         print(f"[{ts}] [{label}] {src_ip}:{src_port} -> {dst_ip}:{dst_port}",
               flush=True)
 
-        # Flow tracking
         key = tuple(sorted([(src_ip, src_port), (dst_ip, dst_port)])) + (proto,)
         if key not in self.flows:
             self.flows[key] = FlowTracker(src_ip, dst_ip, src_port, dst_port, proto)
 
-        flow = self.flows[key]
+        flow      = self.flows[key]
         direction = 's2d' if (src_ip, src_port) == key[0] else 'd2s'
         flow.update(pkt_ip.total_length, direction, flags)
 
@@ -506,7 +474,7 @@ class MITMController(app_manager.RyuApp):
         if n >= 5 and n % 5 == 0 and key not in self.ml_flagged_flows:
             self._run_ml_on_flow(key, flow, ts, dp, eth.src)
 
-        # Rule-based fallback for SSL/session hijack after 20 pkts
+        # Rule-based fallback for SSL / session hijack after 20 pkts
         if n >= 20 and n % 10 == 0 and key not in self.ml_flagged_flows:
             self._rule_fallback(flow, ts, dp, eth.src)
 
@@ -520,23 +488,23 @@ class MITMController(app_manager.RyuApp):
                 continue
             if flow.total_packets < 3:
                 continue
-            self._run_ml_on_flow(key, flow, ts, dp, src_mac, arp_suspect=True)
+            self._run_ml_on_flow(key, flow, ts, dp, src_mac)
 
     # ── ML on a specific flow ─────────────────────────────────────────────────
-    def _run_ml_on_flow(self, key, flow, ts, dp, src_mac, arp_suspect=False):
+    def _run_ml_on_flow(self, key, flow, ts, dp, src_mac):
+        """
+        Score one flow with the ML model.
+        Alert fires ONLY if score >= ML_THRESHOLD (0.5).
+        The arp_suspect lower threshold from v4.0 has been removed — it was
+        the root cause of dishonest detections.
+        """
         score = self._ml_score(flow)
         if score is None:
             return   # model not loaded
 
         flow.last_score = score
 
-        # Lower threshold for flows involving a confirmed ARP suspect IP
-        threshold = 0.3 if arp_suspect or (
-            flow.src_ip in self.arp_suspects or
-            flow.dst_ip in self.arp_suspects
-        ) else 0.5
-
-        if score > threshold:
+        if score >= ML_THRESHOLD:
             self.ml_flagged_flows.add(key)
             flow.is_mitm = True
             attack_type, sub_detail = flow.classify_subtype()
@@ -550,13 +518,12 @@ class MITMController(app_manager.RyuApp):
 
             if conflict_ip:
                 known, forged = self.arp_conflicts[conflict_ip]
-                attack_type  = "ARP POISONING"
-                sub_detail   = (f"score={score:.4f} | ARP conflict on "
-                                f"{conflict_ip} known={known} forged={forged}")
-                # Use stored attacker info if available, then clear the suspect
-                suspect = self.arp_suspects.pop(conflict_ip, None)
-                alert_ip  = suspect['attacker_ip'] if suspect else flow.src_ip
-                alert_mac = suspect['mac']         if suspect else src_mac
+                attack_type   = "ARP POISONING"
+                sub_detail    = (f"score={score:.4f} | ARP conflict on "
+                                 f"{conflict_ip} known={known} forged={forged}")
+                suspect        = self.arp_suspects.pop(conflict_ip, None)
+                alert_ip       = suspect['attacker_ip'] if suspect else flow.src_ip
+                alert_mac      = suspect['mac']         if suspect else src_mac
             else:
                 alert_ip  = flow.src_ip
                 alert_mac = src_mac
@@ -572,18 +539,18 @@ class MITMController(app_manager.RyuApp):
 
     # ── Rule-based fallback for SSL strip / session hijack ────────────────────
     def _rule_fallback(self, flow, ts, dp, src_mac):
-        n    = flow.total_packets
+        n     = flow.total_packets
         rst_r = flow.rst_count / max(n, 1)
 
         if flow.dst_port in (443, 8443) or flow.src_port in (443, 8443):
             detail = (f"TLS port {flow.dst_port or flow.src_port} | "
-                      f"pkts={n} | ML did not flag (score<0.5)")
+                      f"pkts={n} | ML score={flow.last_score:.4f} (<{ML_THRESHOLD})")
             self._trigger_alert("SSL STRIPPING", flow.src_ip, src_mac, dp,
                                 "RULE-BASED FALLBACK", detail)
 
         if rst_r > 0.15 and flow.ack_count > 5:
             detail = (f"RST ratio={rst_r:.2f} ACKs={flow.ack_count} | "
-                      f"pkts={n} | ML did not flag (score<0.5)")
+                      f"pkts={n} | ML score={flow.last_score:.4f} (<{ML_THRESHOLD})")
             self._trigger_alert("SESSION HIJACKING", flow.src_ip, src_mac, dp,
                                 "RULE-BASED FALLBACK", detail)
 
@@ -595,7 +562,7 @@ class MITMController(app_manager.RyuApp):
                 return
             if not ((payload[2] >> 7) & 1):   # QR bit must be 1 (response)
                 return
-            if int.from_bytes(payload[6:8], 'big') == 0:  # ANCOUNT > 0
+            if int.from_bytes(payload[6:8], 'big') == 0:  # ANCOUNT must be > 0
                 return
             pos, parts = 12, []
             while pos < len(payload) and payload[pos] != 0:
@@ -605,7 +572,7 @@ class MITMController(app_manager.RyuApp):
             domain = '.'.join(parts) or f'?@{src_ip}'
             self.dns_responses.setdefault(domain, set()).add(src_ip)
             if len(self.dns_responses[domain]) > 1:
-                ips = ', '.join(sorted(self.dns_responses[domain]))
+                ips    = ', '.join(sorted(self.dns_responses[domain]))
                 detail = f"domain '{domain}' -> multiple IPs: [{ips}]"
                 self._trigger_alert("DNS HIJACKING", src_ip, src_mac, dp,
                                     "RULE-BASED", detail)
@@ -622,34 +589,32 @@ class MITMController(app_manager.RyuApp):
 
         ts = datetime.datetime.now().strftime('%H:%M:%S')
 
-        # How-it-was-detected explanation per method
         HOW = {
             "ML MODEL (CNN+LSTM)": {
-                "ARP POISONING":     "CNN+LSTM scored flow anomaly AND ARP table conflict found",
-                "SSL STRIPPING":     "CNN+LSTM scored flow anomaly on TLS-port traffic",
-                "SESSION HIJACKING": "CNN+LSTM scored flow anomaly on RST/ACK pattern",
-                "DNS HIJACKING":     "CNN+LSTM scored flow anomaly on DNS traffic",
+                "ARP POISONING":     "CNN+LSTM scored flow >=0.5 AND ARP table conflict confirmed",
+                "SSL STRIPPING":     "CNN+LSTM scored TLS-port flow >=0.5",
+                "SESSION HIJACKING": "CNN+LSTM scored RST/ACK flow >=0.5",
+                "DNS HIJACKING":     "CNN+LSTM scored DNS-port flow >=0.5",
             },
             "RULE-BASED": {
-                "ARP POISONING":  "ARP reply changed IP->MAC mapping (forged ARP detected)",
+                "ARP POISONING":  "ARP reply changed IP->MAC mapping; no scorable flows available",
                 "DNS HIJACKING":  "Same domain resolved to different IPs by different servers",
             },
             "RULE-BASED FALLBACK": {
-                "SSL STRIPPING":     "TCP flow to port 443/8443 seen 20+ packets, ML score<0.5",
-                "SESSION HIJACKING": "RST ratio>15% + ACK count>5 after 20+ packets, ML score<0.5",
+                "SSL STRIPPING":     "TCP flow to 443/8443 seen 20+ pkts; ML score below 0.5",
+                "SESSION HIJACKING": "RST ratio>15% + ACK count>5 after 20+ pkts; ML score below 0.5",
             },
         }
         how = HOW.get(method, {}).get(attack_type, f"{method} detection triggered")
 
-        W = 64  # inner column width
+        W = 64
         def _col(label, value):
             s = label + value
             if len(s) > W:
                 s = s[:W-2] + ".."
             return f"|  {s:<{W}}|"
 
-        # ── Print the detection alert box ──────────────────────────────────
-        sep = "=" * 66
+        sep  = "=" * 66
         dash = "-" * 66
         print(flush=True)
         print(Fore.RED + Style.BRIGHT + f"+{sep}+", flush=True)
@@ -673,7 +638,6 @@ class MITMController(app_manager.RyuApp):
         self.blocked_macs.add(mac)
         self.blocked_ips.add(ip)
 
-        # JSON log
         try:
             log_path = "/tmp/mitm_alerts.json"
             existing = json.loads(open(log_path).read() or '[]')
@@ -684,8 +648,7 @@ class MITMController(app_manager.RyuApp):
         except Exception:
             pass
 
-        # Block on switch
-        parser    = dp.ofproto_parser
+        parser = dp.ofproto_parser
         self._add_flow(dp, 100, parser.OFPMatch(eth_src=mac), [])
         self._add_flow(dp, 100, parser.OFPMatch(eth_type=0x0800, ipv4_src=ip), [])
 
@@ -697,8 +660,18 @@ class MITMController(app_manager.RyuApp):
             self._print_stats()
 
     def _flush_old_arp_suspects(self):
-        """After 20s, do a final ML scan; report best score as ML detection.
-        Only use rule-based if there are no scorable flows at all."""
+        """
+        Called every 10s. For each ARP suspect that has waited >= 20s:
+
+          1. Run a final ML scan across all relevant flows.
+          2. If ANY flow scores >= ML_THRESHOLD → alert as ML detection.
+          3. If flows exist but all scored < ML_THRESHOLD → log the miss,
+             do NOT raise a false alert. The rule-based path would not fire
+             here because a) it already had a chance via _rule_fallback, and
+             b) a low ML score is evidence AGAINST this being an attack.
+          4. If NO scorable flows at all → fire RULE-BASED (the ARP conflict
+             itself is definitive evidence; we just have no flow to score).
+        """
         now = time.time()
         for conflict_ip, s in list(self.arp_suspects.items()):
             if now - s['at'] < 20:
@@ -706,33 +679,50 @@ class MITMController(app_manager.RyuApp):
             self.arp_suspects.pop(conflict_ip, None)
             ts = datetime.datetime.now().strftime('%H:%M:%S')
 
-            # Final ML scan — pick the highest scoring flow for this IP
             best_score, best_flow = 0.0, None
+            flows_found = 0
+
             for key, flow in list(self.flows.items()):
                 if flow.src_ip != conflict_ip and flow.dst_ip != conflict_ip:
                     continue
                 if flow.total_packets < 3:
                     continue
+                flows_found += 1
                 score = self._ml_score(flow)
-                if score is not None and score > best_score:
+                if score is None:
+                    continue
+                flow.last_score = score
+                print(f"[{ts}] [ML   ] Final ARP scan: {flow.src_ip}->{flow.dst_ip} "
+                      f"pkts={flow.total_packets} score={score:.4f}", flush=True)
+                if score > best_score:
                     best_score, best_flow = score, flow
 
-            if best_flow is not None:
-                # ML ran and produced a score — report as ML detection
-                print(f"[{ts}] [ML   ] Final ARP scan: best score={best_score:.4f} "
-                      f"on {best_flow.src_ip}->{best_flow.dst_ip}", flush=True)
+            if best_flow is not None and best_score >= ML_THRESHOLD:
+                # ── ML confirmed ──────────────────────────────────────────
                 detail = (f"score={best_score:.4f} | ARP conflict: {conflict_ip} "
                           f"known={s['known']} forged={s['forged']} "
                           f"| best flow: {best_flow.src_ip}->{best_flow.dst_ip} "
                           f"pkts={best_flow.total_packets}")
+                print(f"[{ts}] [ML   ] ARP POISONING confirmed — "
+                      f"score={best_score:.4f} >= {ML_THRESHOLD}", flush=True)
                 self._trigger_alert("ARP POISONING", s['attacker_ip'], s['mac'],
                                     s['dp'], "ML MODEL (CNN+LSTM)", detail)
-            else:
-                # No flows at all — pure rule-based
-                print(f"[{ts}] [ARP  ] No scorable flows found — rule-based only",
+
+            elif flows_found > 0:
+                # ── Flows existed but all scored below threshold ───────────
+                # Do NOT raise an alert — low ML score is evidence of normalcy.
+                print(f"[{ts}] [ARP  ] ARP conflict on {conflict_ip}: "
+                      f"{flows_found} flow(s) scored, best={best_score:.4f} "
+                      f"< {ML_THRESHOLD} — NOT flagging (insufficient ML evidence)",
                       flush=True)
+
+            else:
+                # ── No flows at all — only rule-based evidence available ───
+                print(f"[{ts}] [ARP  ] ARP conflict on {conflict_ip}: "
+                      f"no scorable flows — rule-based only", flush=True)
                 detail = (f"ARP table conflict: {conflict_ip} "
-                          f"known={s['known']} forged={s['forged']} | no flows to score")
+                          f"known={s['known']} forged={s['forged']} "
+                          f"| no flows to score")
                 self._trigger_alert("ARP POISONING", s['attacker_ip'], s['mac'],
                                     s['dp'], "RULE-BASED", detail)
 
