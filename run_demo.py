@@ -173,7 +173,7 @@ def run_demo():
     # Hard stop if basic connectivity is broken
     if not check_ping(victim, '10.0.0.2', 'victim → server'):
         print("\n  Dumping OVS flows for diagnosis:")
-        print(os.popen('ovs-ofctl dump-flows s1 2>/dev/null').read()[:800])
+        print(os.popen('ovs-ofctl -O OpenFlow13 dump-flows s1 2>/dev/null').read()[:800])
         print("\n  Opening CLI — run 'pingall' and check Ryu terminal.")
         CLI(net)
         net.stop()
@@ -252,8 +252,9 @@ def run_demo():
 
     # ── Phase 7: Detection summary ─────────────────────────
     print("\n🛡️  Phase 7: Check Ryu terminal for:")
-    print("     [RULE] ARP SPOOFING detected")
-    print("     [ML]   MITM ANOMALY score > 0.7  →  attacker MAC blocked")
+    print("     [ML] ARP POISONING   — detected by ML model (flow anomaly + ARP conflict)")
+    print("     [ML] SSL STRIPPING   — detected by ML model (or rule fallback if ML misses)")
+    print("     [ML] SESSION HIJACK  — detected by ML model (or rule fallback if ML misses)")
 
     print("\n" + "="*60)
     print("📊 DEMO COMPLETE — Interactive CLI open")

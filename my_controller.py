@@ -1,19 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-my_controller.py
-Clean SDN Controller for MITM Detection with Live Dashboard
+my_controller.py - Unified MITM Detection Controller v4.0
+
+Detection rules:
+  ARP Poisoning     -> RULE-BASED (IP->MAC binding change is definitive)
+  SSL Stripping     -> ML MODEL first, RULE-BASED FALLBACK after 20 pkts
+  Session Hijacking -> ML MODEL first, RULE-BASED FALLBACK after 20 pkts
+  DNS Hijacking     -> RULE-BASED (DNS response divergence)
 """
 
-import os
-import time
-import datetime
-import threading
+import os, time, datetime, json, collections
 import numpy as np
 import joblib
 from tabulate import tabulate
-from colorama import Fore, Style, init
+from colorama import Fore, Back, Style, init
 
-# Ryu imports
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
@@ -22,561 +23,741 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, arp, ipv4, tcp, udp, ether_types
 from ryu.lib import hub
 
-# Initialize colorama
 init(autoreset=True)
 
-# ML Libraries
 try:
     import tensorflow as tf
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
 
-# FEATURES is loaded at runtime from selected_features.pkl so it always
-# matches whatever the trained model actually expects.  This list is only
-# used as a last-resort fallback if the pkl is missing.
-_FALLBACK_FEATURES = [
+# Feature list — overwritten from selected_features.pkl at startup
+FEATURES = [
     'src_port', 'dst_port', 'bidirectional_duration_ms', 'bidirectional_bytes',
-    'src2dst_duration_ms', 'src2dst_packets', 'src2dst_bytes',
+    'src2dst_packets', 'src2dst_bytes', 'dst2src_bytes',
     'bidirectional_min_ps', 'bidirectional_mean_ps', 'bidirectional_stddev_ps',
-    'bidirectional_max_ps', 'src2dst_max_ps', 'dst2src_min_ps', 'dst2src_max_ps',
-    'bidirectional_mean_piat_ms', 'bidirectional_max_piat_ms', 'src2dst_max_piat_ms',
-    'application_name', 'requested_server_name',
-    'byte_asymmetry', 'bytes_per_packet', 'src2dst_bpp', 'dst2src_bpp',
+    'bidirectional_max_ps', 'src2dst_min_ps', 'src2dst_mean_ps',
+    'dst2src_min_ps', 'dst2src_mean_ps',
+    'bidirectional_mean_piat_ms', 'bidirectional_stddev_piat_ms',
+    'bidirectional_max_piat_ms', 'src2dst_mean_piat_ms', 'src2dst_max_piat_ms',
+    'byte_asymmetry', 'bytes_per_packet', 'src2dst_bpp',
     'duration_ratio', 'ps_variance_ratio',
 ]
-FEATURES = _FALLBACK_FEATURES  # overwritten from pkl in _load_model()
 
+DNS_PORT = 53
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 class FlowTracker:
     def __init__(self, src_ip, dst_ip, src_port, dst_port, protocol):
-        self.src_ip = src_ip
-        self.dst_ip = dst_ip
+        self.src_ip   = src_ip
+        self.dst_ip   = dst_ip
         self.src_port = src_port
         self.dst_port = dst_port
         self.protocol = protocol
 
         now = time.time()
-        self.start_time = now
-        self.last_time = now
+        self.start_time    = now
+        self.last_time     = now
+        self.s2d_last_time = now
+        self.s2d_start_time = None
 
-        # Bidirectional counters
-        self.s2d_packets = 0
-        self.s2d_bytes = 0
-        self.d2s_packets = 0
-        self.d2s_bytes = 0
+        self.s2d_packets = 0;  self.s2d_bytes = 0
+        self.d2s_packets = 0;  self.d2s_bytes = 0
 
-        # Packet size tracking — bidirectional and per-direction
-        self.packet_sizes = []       # all packets
-        self.s2d_packet_sizes = []   # src→dst only
-        self.d2s_packet_sizes = []   # dst→src only
+        self.packet_sizes    = []
+        self.s2d_packet_sizes = []
+        self.d2s_packet_sizes = []
+        self.piats           = []
+        self.s2d_piats       = []
 
-        # PIAT tracking — bidirectional and per-direction
-        self.piats = []              # all inter-arrival times
-        self.s2d_piats = []          # src→dst only
-        self.s2d_last_time = now     # timestamp of last s2d packet
-
-        # Directional duration tracking
-        self.s2d_start_time = None   # set on first s2d packet
-
-        # TCP flag counts (kept for rule-based layer, not fed to ML)
-        self.syn_count = 0
-        self.ack_count = 0
-        self.rst_count = 0
-        self.fin_count = 0
+        self.syn_count = 0; self.ack_count = 0
+        self.rst_count = 0; self.fin_count = 0
 
         self.last_score = 0.0
-        self.is_mitm = False
+        self.is_mitm    = False
+
+    @property
+    def total_packets(self):
+        return self.s2d_packets + self.d2s_packets
 
     def update(self, size, direction, flags=0):
         now = time.time()
-        piat_ms = (now - self.last_time) * 1000
-        self.piats.append(piat_ms)
+        self.piats.append((now - self.last_time) * 1000)
         self.last_time = now
         self.packet_sizes.append(size)
 
         if direction == 's2d':
-            self.s2d_packets += 1
-            self.s2d_bytes += size
+            self.s2d_packets += 1; self.s2d_bytes += size
             self.s2d_packet_sizes.append(size)
             self.s2d_piats.append((now - self.s2d_last_time) * 1000)
             self.s2d_last_time = now
             if self.s2d_start_time is None:
                 self.s2d_start_time = now
         else:
-            self.d2s_packets += 1
-            self.d2s_bytes += size
+            self.d2s_packets += 1; self.d2s_bytes += size
             self.d2s_packet_sizes.append(size)
 
-        # TCP flags: FIN=1, SYN=2, RST=4, PSH=8, ACK=16
         if flags & 0x02: self.syn_count += 1
         if flags & 0x10: self.ack_count += 1
         if flags & 0x04: self.rst_count += 1
         if flags & 0x01: self.fin_count += 1
 
-    def classify_mitm_type(self):
-        """
-        Classify the MITM attack subtype using flow-level behavioral signals.
-        Returns a tuple of (attack_type_string, reason_string).
-        """
-        total_pkts = self.s2d_packets + self.d2s_packets
-        total_bytes = self.s2d_bytes + self.d2s_bytes
-        safe_pkts = total_pkts if total_pkts > 0 else 1
-
-        pkt_asym = abs(self.s2d_packets - self.d2s_packets) / safe_pkts
-        byte_asym = abs(self.s2d_bytes - self.d2s_bytes) / (total_bytes + 1)
-        rst_r = self.rst_count / safe_pkts
-        syn_r = self.syn_count / safe_pkts
-        mean_piat = np.mean(self.piats) if self.piats else 0
-        std_piat = np.std(self.piats) if self.piats else 0
-        piat_cv = std_piat / (mean_piat + 1e-6)  # coefficient of variation
-
-        # 1. SSL Stripping: HTTP traffic appearing on port 443-neighbour flows
-        #    or plain HTTP (80/8080) with very low piat variance (downgraded relay)
-        if self.dst_port in (443, 8443) or self.src_port in (443, 8443):
-            return ("SSL STRIPPING", f"TLS port flow downgraded (port={self.dst_port or self.src_port})")
-
-        # 2. Session Hijacking: high RST ratio mid-flow (RST injection) + ongoing ACKs
-        if rst_r > 0.15 and self.ack_count > 5:
-            return ("SESSION HIJACKING", f"RST injection detected (rst_ratio={rst_r:.2f}, acks={self.ack_count})")
-
-        # 3. Relay / Traffic Interception: both high packet & byte asymmetry
-        #    Classic sign of relay — one side receives more than it should
-        if pkt_asym > 0.35 and byte_asym > 0.30:
-            return ("PACKET INTERCEPTION", f"Bidirectional asymmetry (pkt={pkt_asym:.2f}, byte={byte_asym:.2f})")
-
-        # 4. Flood Relay (bulk connection flood by attacker to generate ML trigger)
-        #    Very low PIAT variance = robotic/automated traffic, not human
-        if total_pkts > 30 and piat_cv < 0.5 and mean_piat < 50:
-            return ("RELAY FLOOD", f"Automated relay pattern (piat_cv={piat_cv:.2f}, mean_piat={mean_piat:.1f}ms)")
-
-        # 5. Generic interception if the ML model flagged it but no specific sub-type
-        if pkt_asym > 0.15:
-            return ("TRAFFIC RELAY", f"Mild asymmetry suggestive of relay (pkt_asym={pkt_asym:.2f})")
-
-        return ("ML ANOMALY", "Flow statistics deviate from normal baseline")
-
     def get_features(self):
-        """
-        Returns a dict whose keys exactly match selected_features.pkl so the
-        ML model receives the same feature space it was trained on.
-        """
-        now = time.time()
-        total_pkts  = self.s2d_packets + self.d2s_packets
+        now         = time.time()
+        total_pkts  = self.total_packets
         total_bytes = self.s2d_bytes + self.d2s_bytes
         safe_pkts   = max(total_pkts, 1)
 
-        # ── packet size stats ──────────────────────────────
-        all_ps  = self.packet_sizes if self.packet_sizes else [0]
-        s2d_ps  = self.s2d_packet_sizes if self.s2d_packet_sizes else [0]
-        d2s_ps  = self.d2s_packet_sizes if self.d2s_packet_sizes else [0]
+        all_ps  = self.packet_sizes    or [0]
+        s2d_ps  = self.s2d_packet_sizes or [0]
+        d2s_ps  = self.d2s_packet_sizes or [0]
+        all_pi  = self.piats           or [0]
+        s2d_pi  = self.s2d_piats       or [0]
 
-        mean_ps = float(np.mean(all_ps))
-        std_ps  = float(np.std(all_ps))
-        min_ps  = float(min(all_ps))
-        max_ps  = float(max(all_ps))
+        mean_ps  = float(np.mean(all_ps));  std_ps  = float(np.std(all_ps))
+        mean_pi  = float(np.mean(all_pi));  std_pi  = float(np.std(all_pi))
 
-        # ── PIAT stats ─────────────────────────────────────
-        all_piat  = self.piats if self.piats else [0]
-        s2d_piat  = self.s2d_piats if self.s2d_piats else [0]
-
-        mean_piat = float(np.mean(all_piat))
-        max_piat  = float(max(all_piat))
-
-        # ── directional durations ──────────────────────────
-        bidi_dur  = (now - self.start_time) * 1000
-        s2d_dur   = ((self.s2d_last_time - self.s2d_start_time) * 1000
-                     if self.s2d_start_time is not None else 0.0)
-        d2s_dur   = max(bidi_dur - s2d_dur, 0.0)
+        bidi_dur = (now - self.start_time) * 1000
+        s2d_dur  = ((self.s2d_last_time - self.s2d_start_time) * 1000
+                    if self.s2d_start_time else 0.0)
+        d2s_dur  = max(bidi_dur - s2d_dur, 0.0)
 
         return {
-            # ── features the model was trained on ──────────
-            'src_port':                  self.src_port,
-            'dst_port':                  self.dst_port,
-            'bidirectional_duration_ms': bidi_dur,
-            'bidirectional_bytes':       float(total_bytes),
-            'src2dst_duration_ms':       s2d_dur,
-            'src2dst_packets':           float(self.s2d_packets),
-            'src2dst_bytes':             float(self.s2d_bytes),
-            'bidirectional_min_ps':      min_ps,
-            'bidirectional_mean_ps':     mean_ps,
-            'bidirectional_stddev_ps':   std_ps,
-            'bidirectional_max_ps':      max_ps,
-            'src2dst_max_ps':            float(max(s2d_ps)),
-            'dst2src_min_ps':            float(min(d2s_ps)),
-            'dst2src_max_ps':            float(max(d2s_ps)),
-            'bidirectional_mean_piat_ms':mean_piat,
-            'bidirectional_max_piat_ms': max_piat,
-            'src2dst_max_piat_ms':       float(max(s2d_piat)),
-            # text categoricals are unknown at runtime → use 0 (encoded "unknown")
-            'application_name':          0.0,
-            'requested_server_name':     0.0,
-            # engineered features (same formulas as train_model.py)
-            'byte_asymmetry':  abs(self.s2d_bytes - self.d2s_bytes) / (total_bytes + 1),
-            'bytes_per_packet':total_bytes / safe_pkts,
-            'src2dst_bpp':     self.s2d_bytes / (self.s2d_packets + 1),
-            'dst2src_bpp':     self.d2s_bytes / (self.d2s_packets + 1),
-            'duration_ratio':  s2d_dur / (d2s_dur + 1),
+            'src_port':                     float(self.src_port),
+            'dst_port':                     float(self.dst_port),
+            'protocol':                     float(self.protocol),
+            'bidirectional_duration_ms':    bidi_dur,
+            'bidirectional_packets':        float(total_pkts),
+            'bidirectional_bytes':          float(total_bytes),
+            'src2dst_duration_ms':          s2d_dur,
+            'src2dst_packets':              float(self.s2d_packets),
+            'src2dst_bytes':                float(self.s2d_bytes),
+            'dst2src_packets':              float(self.d2s_packets),
+            'dst2src_bytes':                float(self.d2s_bytes),
+            'bidirectional_min_ps':         float(min(all_ps)),
+            'bidirectional_mean_ps':        mean_ps,
+            'bidirectional_stddev_ps':      std_ps,
+            'bidirectional_max_ps':         float(max(all_ps)),
+            'src2dst_min_ps':               float(min(s2d_ps)),
+            'src2dst_mean_ps':              float(np.mean(s2d_ps)),
+            'src2dst_max_ps':               float(max(s2d_ps)),
+            'dst2src_min_ps':               float(min(d2s_ps)),
+            'dst2src_mean_ps':              float(np.mean(d2s_ps)),
+            'dst2src_max_ps':               float(max(d2s_ps)),
+            'bidirectional_mean_piat_ms':   mean_pi,
+            'bidirectional_stddev_piat_ms': std_pi,
+            'bidirectional_max_piat_ms':    float(max(all_pi)),
+            'src2dst_mean_piat_ms':         float(np.mean(s2d_pi)),
+            'src2dst_max_piat_ms':          float(max(s2d_pi)),
+            'bidirectional_syn_packets':    float(self.syn_count),
+            'bidirectional_ack_packets':    float(self.ack_count),
+            'bidirectional_rst_packets':    float(self.rst_count),
+            'bidirectional_fin_packets':    float(self.fin_count),
+            'application_name':             0.0,
+            'requested_server_name':        0.0,
+            'packet_asymmetry':  abs(self.s2d_packets - self.d2s_packets) / safe_pkts,
+            'byte_asymmetry':    abs(self.s2d_bytes - self.d2s_bytes) / (total_bytes + 1),
+            'bytes_per_packet':  total_bytes / safe_pkts,
+            'src2dst_bpp':       self.s2d_bytes / (self.s2d_packets + 1),
+            'dst2src_bpp':       self.d2s_bytes / (self.d2s_packets + 1),
+            'syn_ratio':         self.syn_count / safe_pkts,
+            'rst_ratio':         self.rst_count / safe_pkts,
+            'duration_ratio':    s2d_dur / (d2s_dur + 1),
             'ps_variance_ratio': (std_ps ** 2) / (mean_ps + 1),
+            'piat_variance_ratio': (std_pi ** 2) / (mean_pi + 1),
         }
 
+    def classify_subtype(self):
+        """Return (attack_type, detail_str) based on flow heuristics."""
+        safe   = max(self.total_packets, 1)
+        tb     = self.s2d_bytes + self.d2s_bytes
+        rst_r  = self.rst_count / safe
+        pkt_a  = abs(self.s2d_packets - self.d2s_packets) / safe
+        byte_a = abs(self.s2d_bytes - self.d2s_bytes) / (tb + 1)
+        mi     = float(np.mean(self.piats)) if self.piats else 0
+        si     = float(np.std(self.piats))  if self.piats else 0
+        cv     = si / (mi + 1e-6)
+
+        if (self.dst_port == DNS_PORT or self.src_port == DNS_PORT) and self.protocol == 17:
+            return "DNS HIJACKING", f"UDP/53 flow, pkts={safe}"
+        if self.dst_port in (443, 8443) or self.src_port in (443, 8443):
+            return "SSL STRIPPING", f"TLS port {self.dst_port or self.src_port}, pkts={safe}"
+        if rst_r > 0.15 and self.ack_count > 5:
+            return "SESSION HIJACKING", f"RST ratio={rst_r:.2f}, ACKs={self.ack_count}"
+        if pkt_a > 0.35 and byte_a > 0.30:
+            return "PACKET INTERCEPTION", f"pkt_asym={pkt_a:.2f}, byte_asym={byte_a:.2f}"
+        if self.total_packets > 30 and cv < 0.5 and mi < 50:
+            return "RELAY FLOOD", f"piat_cv={cv:.2f}, mean_piat={mi:.1f}ms"
+        if pkt_a > 0.15:
+            return "TRAFFIC RELAY", f"pkt_asym={pkt_a:.2f}"
+        return "ML ANOMALY", "flow statistics deviate from baseline"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 class MITMController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
-        super(MITMController, self).__init__(*args, **kwargs)
-        self.mac_to_port = {}
-        self.arp_table = {}  # IP -> MAC
-        self.flows = {}      # (ip1, ip2, port1, port2, proto) -> FlowTracker
-        self.datapaths = {}
-        self.blocked_macs = set()
-        self.blocked_ips = set()
-        self.detections = []
+        super().__init__(*args, **kwargs)
+
+        self.mac_to_port      = {}
+        self.arp_table        = {}   # ip -> mac  (first seen)
+        self.arp_conflicts    = {}   # ip -> (known_mac, forged_mac)
+        self.dai_bindings     = {}   # ip -> set of MACs
+        self.dns_responses    = {}   # domain -> set of IPs
+        self.flows            = {}   # flow_key -> FlowTracker
+        self.datapaths        = {}
+        self.blocked_macs     = set()
+        self.blocked_ips      = set()
+        self.detections       = []
         self.triggered_alerts = set()
-        
-        # Load Model
-        self.model = None
+        self.ml_flagged_flows = set()
+        self.attack_counts    = collections.defaultdict(int)
+
+        self.arp_suspects = {}   # conflict_ip -> {known, forged, attacker_ip, mac, dp, at}
+
+        self.model  = None
         self.scaler = None
         self._load_model()
-        
-        # Print Header
-        self._print_header()
-        
-        # Start Stats Timer
-        self.stats_thread = hub.spawn(self._stats_timer)
+        self._print_banner()
+        hub.spawn(self._stats_loop)
 
+    # ── Model loading ─────────────────────────────────────────────────────────
     def _load_model(self):
         global FEATURES
-        # Support both Docker (/app/model/) and local (model/) paths
-        base = "/app/model" if os.path.exists("/app/model") else "model"
+        base   = "/app/model" if os.path.exists("/app/model") else "model"
         m_path = f"{base}/mitm_model.h5"
         s_path = f"{base}/scaler.pkl"
         f_path = f"{base}/selected_features.pkl"
 
         if not ML_AVAILABLE:
-            self.logger.warning("TensorFlow not available — ML detection disabled.")
+            self.logger.warning("TensorFlow not available — ML disabled.")
             return
-
-        if not os.path.exists(m_path):
-            self.logger.error(f"Model file not found: {m_path}  Run train_model.py first.")
+        # Prefer SavedModel directory (version-agnostic), fall back to .h5
+        saved_path = f"{base}/mitm_model_saved"
+        if os.path.isdir(saved_path):
+            m_path = saved_path
+        elif not os.path.exists(m_path) or os.path.getsize(m_path) == 0:
+            self.logger.warning(f"Model file missing/empty: {m_path}")
             return
-
         try:
-            self.model  = tf.keras.models.load_model(m_path)
-            self.scaler = joblib.load(s_path) if os.path.exists(s_path) else None
-            if self.scaler is None:
-                self.logger.warning(f"Scaler not found at {s_path} — predictions may be inaccurate.")
-
-            # Load the feature list the model was ACTUALLY trained on.
-            # This is the critical part: FEATURES must match selected_features.pkl
-            # exactly, or the model receives garbage input and never fires.
-            if os.path.exists(f_path):
-                loaded = joblib.load(f_path)
-                FEATURES = loaded
-                self.logger.info(f"Feature list loaded from pkl ({len(FEATURES)} features).")
+            if os.path.isdir(m_path):
+                self.model = tf.saved_model.load(m_path)
+                self._model_is_savedmodel = True
             else:
-                self.logger.warning(
-                    f"selected_features.pkl not found at {f_path}. "
-                    "Using fallback feature list — re-train if detection fails."
-                )
-
-            self.logger.info(
-                f"CNN+LSTM model loaded  ({len(FEATURES)} features, "
-                f"scaler={'yes' if self.scaler else 'NO'})"
-            )
+                self.model = tf.keras.models.load_model(m_path)
+                self._model_is_savedmodel = False
+            if os.path.exists(s_path) and os.path.getsize(s_path) > 0:
+                self.scaler = joblib.load(s_path)
+            if os.path.exists(f_path) and os.path.getsize(f_path) > 0:
+                FEATURES = joblib.load(f_path)
+                self.logger.info(f"Loaded {len(FEATURES)} features from pkl.")
+            self.logger.info(f"CNN+LSTM model loaded. Features={len(FEATURES)}, "
+                             f"Scaler={'YES' if self.scaler else 'NO'}")
         except Exception as e:
-            self.logger.error(f"Error loading model artefacts: {e}")
+            self.logger.error(f"Model load failed: {e}")
             self.model = None
 
-    def _print_header(self):
-        print(Fore.CYAN + Style.BRIGHT + "╔══════════════════════════════════════╗")
-        print(Fore.CYAN + Style.BRIGHT + "║   MITM DETECTION CONTROLLER v1.0    ║")
-        print(Fore.CYAN + Style.BRIGHT + "║   Layer 1: ARP Rule-based           ║")
-        print(Fore.CYAN + Style.BRIGHT + "║   Layer 2: CNN+LSTM ML Model        ║")
-        print(Fore.CYAN + Style.BRIGHT + "╚══════════════════════════════════════╝")
+    def _ml_score(self, flow):
+        """Run ML on a flow. Returns float score or None on error."""
+        if not self.model:
+            return None
+        try:
+            fd  = flow.get_features()
+            vec = np.array([[fd[f] for f in FEATURES]], dtype=np.float32)
+            if self.scaler:
+                vec = self.scaler.transform(vec)
+            vec = vec.reshape(1, len(FEATURES), 1)
+            if getattr(self, '_model_is_savedmodel', False):
+                return float(self.model.serve(tf.constant(vec))[0][0])
+            return float(self.model.predict(vec, verbose=0)[0][0])
+        except Exception as e:
+            self.logger.error(f"ML score error: {e}")
+            return None
 
+    # ── Banner ────────────────────────────────────────────────────────────────
+    def _print_banner(self):
+        ml = "LOADED" if self.model else "NOT FOUND (rule-based only)"
+        lines = [
+            "=" * 62,
+            f"  MITM DETECTION CONTROLLER v4.0",
+            f"  ML Model   : {ml}",
+            f"  Features   : {len(FEATURES)}",
+            "-" * 62,
+            "  ARP Poisoning     : ML Model(CNN+LSTM)",
+            "  SSL Stripping     : ML MODEL -> RULE-BASED fallback",
+            "  Session Hijacking : ML MODEL -> RULE-BASED fallback",
+            "  DNS Hijacking     : RULE-BASED",
+            "=" * 62,
+        ]
+        for l in lines:
+            print(Fore.CYAN + Style.BRIGHT + l, flush=True)
+
+    # ── Datapath management ───────────────────────────────────────────────────
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
-        datapath = ev.datapath
+        dp = ev.datapath
         if ev.state == MAIN_DISPATCHER:
-            self.datapaths[datapath.id] = datapath
+            self.datapaths[dp.id] = dp
         elif ev.state == DEAD_DISPATCHER:
-            self.datapaths.pop(datapath.id, None)
+            self.datapaths.pop(dp.id, None)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        datapath = ev.msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
+        dp      = ev.msg.datapath
+        ofproto = dp.ofproto
+        parser  = dp.ofproto_parser
 
-        # Register the datapath here too — EventOFPStateChange is unreliable
-        # in some Ryu forks so we populate datapaths from both handlers.
-        self.datapaths[datapath.id] = datapath
+        # Register in both handlers — EventOFPStateChange is unreliable in some Ryu builds
+        self.datapaths[dp.id] = dp
 
-        # Clear per-datapath state only; leave other switches' data intact
-        self.mac_to_port.pop(datapath.id, None)
-        self.arp_table.clear()
-        self.flows.clear()
-        self.blocked_macs.clear()
-        self.blocked_ips.clear()
-        self.detections.clear()
-        self.triggered_alerts.clear()
+        # Reset state for this switch
+        self.mac_to_port.pop(dp.id, None)
+        for attr in ('arp_table', 'arp_conflicts', 'dai_bindings', 'dns_responses',
+                     'flows', 'blocked_macs', 'blocked_ips', 'detections',
+                     'triggered_alerts', 'ml_flagged_flows', 'attack_counts'):
+            obj = getattr(self, attr)
+            obj.clear()
 
         ts = datetime.datetime.now().strftime('%H:%M:%S')
         print(Fore.GREEN + Style.BRIGHT +
-              f"[{ts}] *** Switch connected: dpid={datapath.id} "
-              f"(total={len(self.datapaths)}) ***")
+              f"\n[{ts}] *** Switch CONNECTED: dpid={dp.id} ***", flush=True)
 
-        # Install table-miss: send ALL unmatched packets to controller.
-        # Without this rule OVS drops unknown packets and Ryu never sees them.
-        match = parser.OFPMatch()
+        # Table-miss: send all unmatched packets to controller
+        match   = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                           ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, 0, match, actions)
-        print(f"[{ts}]   Table-miss flow installed on dpid={datapath.id}")
+        self._add_flow(dp, 0, match, actions)
+        print(f"[{ts}]   Table-miss flow installed.", flush=True)
 
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
+    def _add_flow(self, dp, priority, match, actions):
+        parser = dp.ofproto_parser
+        ofproto = dp.ofproto
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        if buffer_id:
-            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
-                                    priority=priority, match=match, instructions=inst)
-        else:
-            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                    match=match, instructions=inst)
-        datapath.send_msg(mod)
+        dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=priority,
+                                      match=match, instructions=inst))
 
+    # ── Packet-in ─────────────────────────────────────────────────────────────
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
-        msg = ev.msg
-        datapath = msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
+        msg     = ev.msg
+        dp      = msg.datapath
+        ofproto = dp.ofproto
+        parser  = dp.ofproto_parser
         in_port = msg.match['in_port']
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
-        if not eth or eth.ethertype == ether_types.ETH_TYPE_LLDP: return
+        if not eth or eth.ethertype == ether_types.ETH_TYPE_LLDP:
+            return
 
-        ts = datetime.datetime.now().strftime('%H:%M:%S')
+        ts      = datetime.datetime.now().strftime('%H:%M:%S')
         src_mac = eth.src
         dst_mac = eth.dst
-        
-        # Drop packets from already-fully-blocked MACs
-        if src_mac in self.blocked_macs: return
 
-        # ARP handling
+        if src_mac in self.blocked_macs:
+            return
+
         pkt_arp = pkt.get_protocol(arp.arp)
         if pkt_arp:
-            self._handle_arp(datapath, in_port, pkt_arp, eth, ts)
+            self._handle_arp(dp, in_port, pkt_arp, eth, ts)
 
-        # IP handling
-        pkt_ipv4 = pkt.get_protocol(ipv4.ipv4)
-        if pkt_ipv4:
-            if pkt_ipv4.src in self.blocked_ips: return
-            self._handle_ipv4(datapath, in_port, pkt, pkt_ipv4, eth, ts)
+        pkt_ip = pkt.get_protocol(ipv4.ipv4)
+        if pkt_ip:
+            if pkt_ip.src in self.blocked_ips:
+                return
+            self._handle_ip(dp, in_port, pkt, pkt_ip, eth, ts)
 
-        # Learning & Forwarding
-        self.mac_to_port.setdefault(datapath.id, {})
-        self.mac_to_port[datapath.id][src_mac] = in_port
-        
-        if dst_mac in self.mac_to_port[datapath.id]:
-            out_port = self.mac_to_port[datapath.id][dst_mac]
-        else:
-            out_port = ofproto.OFPP_FLOOD
+        # MAC learning + forwarding
+        self.mac_to_port.setdefault(dp.id, {})[src_mac] = in_port
+        out_port = self.mac_to_port[dp.id].get(dst_mac, ofproto.OFPP_FLOOD)
+        actions  = [parser.OFPActionOutput(out_port)]
+        data     = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
+        dp.send_msg(parser.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id,
+                                        in_port=in_port, actions=actions, data=data))
 
-        actions = [parser.OFPActionOutput(out_port)]
-        # We don't install permanent flows so we can keep monitoring packet_ins for stats
-        # but to keep it realistic we could install flows with low idle_timeout.
-        # For this demo, we use PacketIn for all traffic to ensure ML gets every packet.
-        
-        data = None
-        if msg.buffer_id == ofproto.OFP_NO_BUFFER: data = msg.data
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                  in_port=in_port, actions=actions, data=data)
-        datapath.send_msg(out)
-
-    def _handle_arp(self, datapath, in_port, pkt_arp, eth, ts):
-        opcode = "REQUEST" if pkt_arp.opcode == arp.ARP_REQUEST else "REPLY"
+    # ── ARP handler ───────────────────────────────────────────────────────────
+    def _handle_arp(self, dp, in_port, pkt_arp, eth, ts):
+        op      = "REQUEST" if pkt_arp.opcode == arp.ARP_REQUEST else "REPLY"
         src_ip  = pkt_arp.src_ip
         src_mac = eth.src
-        print(f"[{ts}] [{Fore.YELLOW}ARP  {Style.RESET_ALL}] "
-              f"{opcode:<8} {src_ip} ({src_mac}) -> {pkt_arp.dst_ip} | "
-              f"switch={datapath.id} port={in_port}")
+        print(f"[{ts}] [ARP  ] {op:<8} {src_ip} ({src_mac}) -> {pkt_arp.dst_ip}",
+              flush=True)
 
         if src_ip in self.arp_table:
             known = self.arp_table[src_ip]
             if known != src_mac:
-                # Different MAC claiming same IP → ARP spoofing
-                self._trigger_detection(
-                    "ARP POISONING", src_ip, src_mac, datapath, in_port,
-                    f"IP {src_ip} known-MAC={known} fake-MAC={src_mac}"
+                # ── ARP CONFLICT DETECTED ──────────────────────────────────
+                self.arp_conflicts[src_ip] = (known, src_mac)
+                print(f"[{ts}] [ARP  ] *** CONFLICT: {src_ip} "
+                      f"known={known} forged={src_mac} ***", flush=True)
+
+                # Reverse-lookup attacker's real IP from arp_table via MAC
+                attacker_ip = next(
+                    (tbl_ip for tbl_ip, tbl_mac in self.arp_table.items()
+                     if tbl_mac == src_mac and tbl_ip != src_ip),
+                    None
                 )
-                return   # do not update table with the forged MAC
+                alert_ip = attacker_ip if attacker_ip else src_ip
+
+                if self.model:
+                    # Defer to ML — _run_ml_on_flow will confirm when relay
+                    # traffic is scored.  Rule-based fires as fallback after 20s.
+                    self.arp_suspects[src_ip] = {
+                        'known': known, 'forged': src_mac,
+                        'attacker_ip': alert_ip, 'mac': src_mac,
+                        'dp': dp, 'at': time.time(),
+                    }
+                    print(f"[{ts}] [ARP  ] Suspect registered — scanning existing "
+                          f"flows for ML confirmation …", flush=True)
+                    # Immediately score any existing flows involving this IP
+                    self._scan_flows_for_arp_suspect(src_ip, ts, dp, src_mac)
+                else:
+                    detail = (f"ARP table conflict: {src_ip} "
+                              f"known={known} forged={src_mac} | ML not loaded")
+                    self._trigger_alert("ARP POISONING", alert_ip, src_mac, dp,
+                                        "RULE-BASED", detail)
+                return   # do NOT update table with forged MAC
         else:
             self.arp_table[src_ip] = src_mac
-            print(f"[{ts}]   [ARP] Recorded: {src_ip} -> {src_mac}")
 
-    def _handle_ipv4(self, datapath, in_port, pkt, pkt_ipv4, eth, ts):
-        src_ip = pkt_ipv4.src
-        dst_ip = pkt_ipv4.dst
-        proto = pkt_ipv4.proto
-        
+        # DAI tracking
+        self.dai_bindings.setdefault(src_ip, set()).add(src_mac)
+        if len(self.dai_bindings[src_ip]) > 1:
+            print(f"[{ts}] [DAI  ] {len(self.dai_bindings[src_ip])} MACs "
+                  f"claim {src_ip}: {sorted(self.dai_bindings[src_ip])}", flush=True)
+
+    def _arp_ml_or_rule(self, conflict_ip, known_mac, forged_mac, ts, dp, in_port):
+        """
+        Try ML on existing flows for conflict_ip.
+        Returns (method_str, detail_str).
+        """
+        best_score = 0.0
+        if self.model:
+            for key, flow in list(self.flows.items()):
+                if flow.src_ip != conflict_ip and flow.dst_ip != conflict_ip:
+                    continue
+                if flow.total_packets < 3:
+                    continue
+                score = self._ml_score(flow)
+                if score is None:
+                    continue
+                flow.last_score = score
+                print(f"[{ts}] [ML   ] ARP scan: {flow.src_ip}->{flow.dst_ip} "
+                      f"pkts={flow.total_packets} score={score:.4f}", flush=True)
+                if score > best_score:
+                    best_score = score
+                if score > 0.5:
+                    self.ml_flagged_flows.add(key)
+                    flow.is_mitm = True
+                    detail = (f"ML score={score:.4f} on flow "
+                              f"{flow.src_ip}->{flow.dst_ip} | "
+                              f"ARP conflict: {conflict_ip} "
+                              f"known={known_mac} forged={forged_mac}")
+                    return "ML MODEL (CNN+LSTM)", detail
+
+        # ML not available or scored below threshold
+        detail = (f"ARP table conflict: {conflict_ip} "
+                  f"known={known_mac} forged={forged_mac}"
+                  + (f" | best ML score={best_score:.4f} (<0.5)"
+                     if self.model else " | ML model not loaded"))
+        return "RULE-BASED", detail
+
+    # ── IPv4 handler ──────────────────────────────────────────────────────────
+    def _handle_ip(self, dp, in_port, pkt, pkt_ip, eth, ts):
+        src_ip = pkt_ip.src
+        dst_ip = pkt_ip.dst
+        proto  = pkt_ip.proto
+
         pkt_tcp = pkt.get_protocol(tcp.tcp)
         pkt_udp = pkt.get_protocol(udp.udp)
-        
-        src_port, dst_port, flags = 0, 0, 0
-        type_str = "IP   "
-        info = ""
+        src_port = dst_port = flags = 0
 
         if pkt_tcp:
-            src_port, dst_port = pkt_tcp.src_port, pkt_tcp.dst_port
-            flags = pkt_tcp.bits
-            type_str = "HTTP " if (dst_port in (8080, 80, 443) or src_port in (8080, 80, 443)) else "TCP  "
-            log_msg = f"[{ts}] [{Fore.BLUE}{type_str}{Style.RESET_ALL}] {src_ip}:{src_port} → {dst_ip}:{dst_port} {info}"
+            src_port = pkt_tcp.src_port
+            dst_port = pkt_tcp.dst_port
+            flags    = pkt_tcp.bits
+            label    = ("HTTP " if dst_port in (80, 443, 8080)
+                        or src_port in (80, 443, 8080) else "TCP  ")
         elif pkt_udp:
-            src_port, dst_port = pkt_udp.src_port, pkt_udp.dst_port
-            type_str = "DNS  " if (dst_port == 53 or src_port == 53) else "UDP  "
-            log_msg = f"[{ts}] [{Fore.BLUE}{type_str}{Style.RESET_ALL}] {src_ip}:{src_port} → {dst_ip}:{dst_port}"
+            src_port = pkt_udp.src_port
+            dst_port = pkt_udp.dst_port
+            label    = "DNS  " if DNS_PORT in (src_port, dst_port) else "UDP  "
+            self._check_dns(pkt_udp, src_ip, dst_ip, eth.src, ts, dp)
         else:
-            log_msg = f"[{ts}] [{Fore.BLUE}{type_str}{Style.RESET_ALL}] {src_ip} → {dst_ip} | bytes={pkt_ipv4.total_length}"
+            label = "IP   "
 
-        print(log_msg)
+        print(f"[{ts}] [{label}] {src_ip}:{src_port} -> {dst_ip}:{dst_port}",
+              flush=True)
 
-        # Track Flow
+        # Flow tracking
         key = tuple(sorted([(src_ip, src_port), (dst_ip, dst_port)])) + (proto,)
         if key not in self.flows:
             self.flows[key] = FlowTracker(src_ip, dst_ip, src_port, dst_port, proto)
-        
+
+        flow = self.flows[key]
         direction = 's2d' if (src_ip, src_port) == key[0] else 'd2s'
-        self.flows[key].update(pkt_ipv4.total_length, direction, flags)
-        
-        flow = self.flows[key]
-        total_p = flow.s2d_packets + flow.d2s_packets
-        
-        # Rule-based detection: check every 5 packets once we have enough data
-        if total_p >= 5 and total_p % 5 == 0:
-            self._check_flow_rules(flow, ts, datapath, eth.src)
+        flow.update(pkt_ip.total_length, direction, flags)
 
-        # ML analysis: run every 10 packets (more responsive for demo)
-        if total_p >= 5 and total_p % 10 == 0:
-            self._run_ml(key, ts, datapath, eth.src)
+        n = flow.total_packets
 
-    def _check_flow_rules(self, flow, ts, datapath, src_mac):
-        """Rule-based MITM sub-type detection — runs independently of ML model."""
-        total_pkts = flow.s2d_packets + flow.d2s_packets
-        safe_pkts = total_pkts if total_pkts > 0 else 1
-        rst_r = flow.rst_count / safe_pkts
+        # ML: check every 5 packets starting at 5
+        if n >= 5 and n % 5 == 0 and key not in self.ml_flagged_flows:
+            self._run_ml_on_flow(key, flow, ts, dp, eth.src)
 
-        # SSL Stripping: flow targeting TLS port (443/8443)
-        if flow.dst_port in (443, 8443) or flow.src_port in (443, 8443):
-            self._trigger_detection(
-                "SSL STRIPPING", flow.src_ip, src_mac, datapath, 0,
-                f"TLS port flow detected (port={flow.dst_port}, pkts={total_pkts})"
-            )
+        # Rule-based fallback for SSL/session hijack after 20 pkts
+        if n >= 20 and n % 10 == 0 and key not in self.ml_flagged_flows:
+            self._rule_fallback(flow, ts, dp, eth.src)
 
-        # Session Hijacking: high RST ratio + ACK count (RST injection attack)
-        if rst_r > 0.15 and flow.ack_count > 5:
-            self._trigger_detection(
-                "SESSION HIJACKING", flow.src_ip, src_mac, datapath, 0,
-                f"RST injection (rst_ratio={rst_r:.2f}, acks={flow.ack_count}, pkts={total_pkts})"
-            )
+    # ── Immediate ML scan when ARP suspect is registered ─────────────────────
+    def _scan_flows_for_arp_suspect(self, conflict_ip, ts, dp, src_mac):
+        """Score all existing flows involving conflict_ip right now."""
+        for key, flow in list(self.flows.items()):
+            if flow.src_ip != conflict_ip and flow.dst_ip != conflict_ip:
+                continue
+            if key in self.ml_flagged_flows:
+                continue
+            if flow.total_packets < 3:
+                continue
+            self._run_ml_on_flow(key, flow, ts, dp, src_mac, arp_suspect=True)
 
-    def _run_ml(self, key, ts, datapath, src_mac):
-        if not self.model: return
-        flow = self.flows[key]
-        feat_dict = flow.get_features()
-        
-        try:
-            vector = np.array([[feat_dict[f] for f in FEATURES]], dtype=np.float32)
-            if self.scaler: vector = self.scaler.transform(vector)
-            vector = vector.reshape(1, vector.shape[1], 1)
-            score = float(self.model.predict(vector, verbose=0)[0][0])
-        except Exception as e:
-            self.logger.error(f"ML prediction error: {e}")
-            return
+    # ── ML on a specific flow ─────────────────────────────────────────────────
+    def _run_ml_on_flow(self, key, flow, ts, dp, src_mac, arp_suspect=False):
+        score = self._ml_score(flow)
+        if score is None:
+            return   # model not loaded
 
         flow.last_score = score
-        status = f"{Fore.RED}MITM 🚨" if score > 0.5 else f"{Fore.GREEN}NORMAL ✅"
-        print(
-            f"[{ts}] [{Fore.MAGENTA}ML   {Style.RESET_ALL}] "
-            f"Flow: {flow.src_ip}→{flow.dst_ip} | "
-            f"pkts={flow.s2d_packets + flow.d2s_packets} | "
-            f"score={score:.4f} | {status}"
-        )
-        
-        # Threshold 0.5 matches the model's training evaluation threshold.
-        # Previously 0.8 caused the detector to miss most attacks.
-        if score > 0.5:
-            flow.is_mitm = True
-            attack_type, reason = flow.classify_mitm_type()
-            self._trigger_detection(attack_type, flow.src_ip, src_mac, datapath, 0, reason)
 
-    def _trigger_detection(self, d_type, ip, mac, dp, port, details):
-        alert_key = (ip, mac, d_type)
-        if alert_key in self.triggered_alerts: return
+        # Lower threshold for flows involving a confirmed ARP suspect IP
+        threshold = 0.3 if arp_suspect or (
+            flow.src_ip in self.arp_suspects or
+            flow.dst_ip in self.arp_suspects
+        ) else 0.5
+
+        if score > threshold:
+            self.ml_flagged_flows.add(key)
+            flow.is_mitm = True
+            attack_type, sub_detail = flow.classify_subtype()
+
+            # Check if this flow involves an ARP-conflicted IP
+            conflict_ip = None
+            if flow.src_ip in self.arp_conflicts:
+                conflict_ip = flow.src_ip
+            elif flow.dst_ip in self.arp_conflicts:
+                conflict_ip = flow.dst_ip
+
+            if conflict_ip:
+                known, forged = self.arp_conflicts[conflict_ip]
+                attack_type  = "ARP POISONING"
+                sub_detail   = (f"score={score:.4f} | ARP conflict on "
+                                f"{conflict_ip} known={known} forged={forged}")
+                # Use stored attacker info if available, then clear the suspect
+                suspect = self.arp_suspects.pop(conflict_ip, None)
+                alert_ip  = suspect['attacker_ip'] if suspect else flow.src_ip
+                alert_mac = suspect['mac']         if suspect else src_mac
+            else:
+                alert_ip  = flow.src_ip
+                alert_mac = src_mac
+
+            detail = f"score={score:.4f} | {sub_detail}"
+            print(f"[{ts}] [ML   ] DETECTED {attack_type} "
+                  f"{flow.src_ip}->{flow.dst_ip} score={score:.4f}", flush=True)
+            self._trigger_alert(attack_type, alert_ip, alert_mac, dp,
+                                "ML MODEL (CNN+LSTM)", detail)
+        else:
+            print(f"[{ts}] [ML   ] {flow.src_ip}->{flow.dst_ip} "
+                  f"pkts={flow.total_packets} score={score:.4f} NORMAL", flush=True)
+
+    # ── Rule-based fallback for SSL strip / session hijack ────────────────────
+    def _rule_fallback(self, flow, ts, dp, src_mac):
+        n    = flow.total_packets
+        rst_r = flow.rst_count / max(n, 1)
+
+        if flow.dst_port in (443, 8443) or flow.src_port in (443, 8443):
+            detail = (f"TLS port {flow.dst_port or flow.src_port} | "
+                      f"pkts={n} | ML did not flag (score<0.5)")
+            self._trigger_alert("SSL STRIPPING", flow.src_ip, src_mac, dp,
+                                "RULE-BASED FALLBACK", detail)
+
+        if rst_r > 0.15 and flow.ack_count > 5:
+            detail = (f"RST ratio={rst_r:.2f} ACKs={flow.ack_count} | "
+                      f"pkts={n} | ML did not flag (score<0.5)")
+            self._trigger_alert("SESSION HIJACKING", flow.src_ip, src_mac, dp,
+                                "RULE-BASED FALLBACK", detail)
+
+    # ── DNS hijacking check ───────────────────────────────────────────────────
+    def _check_dns(self, pkt_udp, src_ip, dst_ip, src_mac, ts, dp):
+        try:
+            payload = bytes(pkt_udp.data) if pkt_udp.data else b''
+            if len(payload) < 12:
+                return
+            if not ((payload[2] >> 7) & 1):   # QR bit must be 1 (response)
+                return
+            if int.from_bytes(payload[6:8], 'big') == 0:  # ANCOUNT > 0
+                return
+            pos, parts = 12, []
+            while pos < len(payload) and payload[pos] != 0:
+                ln = payload[pos]
+                parts.append(payload[pos+1:pos+1+ln].decode('ascii', errors='ignore'))
+                pos += 1 + ln
+            domain = '.'.join(parts) or f'?@{src_ip}'
+            self.dns_responses.setdefault(domain, set()).add(src_ip)
+            if len(self.dns_responses[domain]) > 1:
+                ips = ', '.join(sorted(self.dns_responses[domain]))
+                detail = f"domain '{domain}' -> multiple IPs: [{ips}]"
+                self._trigger_alert("DNS HIJACKING", src_ip, src_mac, dp,
+                                    "RULE-BASED", detail)
+        except Exception:
+            pass
+
+    # ── Central alert printer + blocker ───────────────────────────────────────
+    def _trigger_alert(self, attack_type, ip, mac, dp, method, detail):
+        alert_key = (ip, mac, attack_type)
+        if alert_key in self.triggered_alerts:
+            return
         self.triggered_alerts.add(alert_key)
-        
+        self.attack_counts[attack_type] += 1
+
         ts = datetime.datetime.now().strftime('%H:%M:%S')
-        
-        print(Fore.RED + Style.BRIGHT + "\n╔════════════════════════════════════════════════════════════╗")
-        print(Fore.RED + Style.BRIGHT + f"║  🚨 MITM ATTACK DETECTED — {d_type:<36}║")
-        print(Fore.RED + Style.BRIGHT + f"║  Time:     {ts:<47}║")
-        print(Fore.RED + Style.BRIGHT + f"║  Host IP:  {ip:<47}║")
-        print(Fore.RED + Style.BRIGHT + f"║  MAC:      {mac:<47}║")
-        print(Fore.RED + Style.BRIGHT + f"║  Details:  {details:<47}║")
-        print(Fore.RED + Style.BRIGHT + "║  Action:   MAC+IP blocked — DROP rule installed            ║")
-        print(Fore.RED + Style.BRIGHT + "╚════════════════════════════════════════════════════════════╝\n")
-        
-        self.detections.append(f"[{ts}] {d_type:<22} {ip} blocked")
+
+        # How-it-was-detected explanation per method
+        HOW = {
+            "ML MODEL (CNN+LSTM)": {
+                "ARP POISONING":     "CNN+LSTM scored flow anomaly AND ARP table conflict found",
+                "SSL STRIPPING":     "CNN+LSTM scored flow anomaly on TLS-port traffic",
+                "SESSION HIJACKING": "CNN+LSTM scored flow anomaly on RST/ACK pattern",
+                "DNS HIJACKING":     "CNN+LSTM scored flow anomaly on DNS traffic",
+            },
+            "RULE-BASED": {
+                "ARP POISONING":  "ARP reply changed IP->MAC mapping (forged ARP detected)",
+                "DNS HIJACKING":  "Same domain resolved to different IPs by different servers",
+            },
+            "RULE-BASED FALLBACK": {
+                "SSL STRIPPING":     "TCP flow to port 443/8443 seen 20+ packets, ML score<0.5",
+                "SESSION HIJACKING": "RST ratio>15% + ACK count>5 after 20+ packets, ML score<0.5",
+            },
+        }
+        how = HOW.get(method, {}).get(attack_type, f"{method} detection triggered")
+
+        W = 64  # inner column width
+        def _col(label, value):
+            s = label + value
+            if len(s) > W:
+                s = s[:W-2] + ".."
+            return f"|  {s:<{W}}|"
+
+        # ── Print the detection alert box ──────────────────────────────────
+        sep = "=" * 66
+        dash = "-" * 66
+        print(flush=True)
+        print(Fore.RED + Style.BRIGHT + f"+{sep}+", flush=True)
+        print(Fore.RED + Style.BRIGHT + f"|{'  *** MITM ATTACK DETECTED ***':<66}|", flush=True)
+        print(Fore.RED + Style.BRIGHT + f"+{dash}+", flush=True)
+        print(Fore.RED + Style.BRIGHT + _col("Attack Type : ", attack_type), flush=True)
+        print(Fore.RED + Style.BRIGHT + _col("Method      : ", method), flush=True)
+        print(Fore.RED + Style.BRIGHT + _col("How         : ", how), flush=True)
+        print(Fore.RED + Style.BRIGHT + _col("Time        : ", ts), flush=True)
+        print(Fore.RED + Style.BRIGHT + _col("Host IP     : ", ip), flush=True)
+        print(Fore.RED + Style.BRIGHT + _col("MAC         : ", mac), flush=True)
+        print(Fore.RED + Style.BRIGHT + _col("Details     : ", detail), flush=True)
+        print(Fore.RED + Style.BRIGHT + _col("Action      : ", "IP and MAC blocked — DROP rules installed"), flush=True)
+        print(Fore.RED + Style.BRIGHT + f"+{sep}+", flush=True)
+        print(flush=True)
+
+        self.detections.append({
+            "time": ts, "type": attack_type, "method": method,
+            "ip": ip, "mac": mac, "detail": detail
+        })
         self.blocked_macs.add(mac)
         self.blocked_ips.add(ip)
-        
-        # Install DROP rule on the switch
-        parser = dp.ofproto_parser
-        match_mac = parser.OFPMatch(eth_src=mac)
-        self.add_flow(dp, 100, match_mac, [])
-        match_ip = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip)
-        self.add_flow(dp, 100, match_ip, [])
 
-    def _stats_timer(self):
+        # JSON log
+        try:
+            log_path = "/tmp/mitm_alerts.json"
+            existing = json.loads(open(log_path).read() or '[]')
+            existing.append({"timestamp": ts, "attack_type": attack_type,
+                             "method": method, "how": how,
+                             "ip": ip, "mac": mac, "detail": detail})
+            open(log_path, 'w').write(json.dumps(existing, indent=2))
+        except Exception:
+            pass
+
+        # Block on switch
+        parser    = dp.ofproto_parser
+        self._add_flow(dp, 100, parser.OFPMatch(eth_src=mac), [])
+        self._add_flow(dp, 100, parser.OFPMatch(eth_type=0x0800, ipv4_src=ip), [])
+
+    # ── Stats loop ────────────────────────────────────────────────────────────
+    def _stats_loop(self):
         while True:
-            hub.sleep(30)
+            hub.sleep(10)
+            self._flush_old_arp_suspects()
             self._print_stats()
+
+    def _flush_old_arp_suspects(self):
+        """After 20s, do a final ML scan; report best score as ML detection.
+        Only use rule-based if there are no scorable flows at all."""
+        now = time.time()
+        for conflict_ip, s in list(self.arp_suspects.items()):
+            if now - s['at'] < 20:
+                continue
+            self.arp_suspects.pop(conflict_ip, None)
+            ts = datetime.datetime.now().strftime('%H:%M:%S')
+
+            # Final ML scan — pick the highest scoring flow for this IP
+            best_score, best_flow = 0.0, None
+            for key, flow in list(self.flows.items()):
+                if flow.src_ip != conflict_ip and flow.dst_ip != conflict_ip:
+                    continue
+                if flow.total_packets < 3:
+                    continue
+                score = self._ml_score(flow)
+                if score is not None and score > best_score:
+                    best_score, best_flow = score, flow
+
+            if best_flow is not None:
+                # ML ran and produced a score — report as ML detection
+                print(f"[{ts}] [ML   ] Final ARP scan: best score={best_score:.4f} "
+                      f"on {best_flow.src_ip}->{best_flow.dst_ip}", flush=True)
+                detail = (f"score={best_score:.4f} | ARP conflict: {conflict_ip} "
+                          f"known={s['known']} forged={s['forged']} "
+                          f"| best flow: {best_flow.src_ip}->{best_flow.dst_ip} "
+                          f"pkts={best_flow.total_packets}")
+                self._trigger_alert("ARP POISONING", s['attacker_ip'], s['mac'],
+                                    s['dp'], "ML MODEL (CNN+LSTM)", detail)
+            else:
+                # No flows at all — pure rule-based
+                print(f"[{ts}] [ARP  ] No scorable flows found — rule-based only",
+                      flush=True)
+                detail = (f"ARP table conflict: {conflict_ip} "
+                          f"known={s['known']} forged={s['forged']} | no flows to score")
+                self._trigger_alert("ARP POISONING", s['attacker_ip'], s['mac'],
+                                    s['dp'], "RULE-BASED", detail)
 
     def _print_stats(self):
         ts = datetime.datetime.now().strftime('%H:%M:%S')
-        print(f"\n{Fore.CYAN}══════════ NETWORK STATS [{ts}] ══════════")
-        print(f"Switches connected : {len(self.datapaths)}")
-        print(f"MACs learned       : {sum(len(v) for v in self.mac_to_port.values())}")
-        print(f"ARP table entries  : {len(self.arp_table)}")
-        print(f"Active flows       : {len(self.flows)}")
-        print(Fore.CYAN + "─────────────────────────────────────────────")
-        print("FLOW TABLE:")
-        flow_data = []
-        for f in list(self.flows.values())[-5:]:
-            total_pkts = f.s2d_packets + f.d2s_packets
-            total_bytes = f.s2d_bytes + f.d2s_bytes
-            dur = int(time.time() - f.start_time)
-            warn = " ⚠️" if f.last_score > 0.5 else ""
-            flow_data.append([f"{f.src_ip} → {f.dst_ip}", total_pkts, total_bytes, f"{dur}s", f"{f.last_score:.2f}{warn}"])
-        
-        if flow_data:
-            print(tabulate(flow_data, headers=["Flow", "Pkts", "Bytes", "Dur", "Score"], tablefmt="plain"))
-        else:
-            print(" (No flows active)")
-            
-        print(Fore.CYAN + "─────────────────────────────────────────────")
-        print("DETECTIONS:")
-        for d in self.detections[-3:]:
-            print(f" {Fore.RED}{d}")
-        if not self.detections: print(" (None)")
-        
-        print(Fore.CYAN + "─────────────────────────────────────────────")
-        print("BLOCKED:")
-        print(f" MACs: {', '.join(self.blocked_macs) or '(None)'}")
-        print(f" IPs : {', '.join(self.blocked_ips) or '(None)'}")
-        print(Fore.CYAN + "══════════════════════════════════════════════\n")
+        print(Fore.CYAN + f"\n{'='*60} [{ts}]", flush=True)
+        print(Fore.CYAN + f"  Switches: {len(self.datapaths)}  "
+              f"Flows: {len(self.flows)}  "
+              f"ARP entries: {len(self.arp_table)}", flush=True)
+
+        if self.attack_counts:
+            print(Fore.CYAN + "  Attack counts:", flush=True)
+            for atype, cnt in sorted(self.attack_counts.items()):
+                print(Fore.CYAN + f"    {atype:<26}: {cnt}", flush=True)
+
+        if self.detections:
+            print(Fore.CYAN + "  Recent detections:", flush=True)
+            for d in self.detections[-5:]:
+                print(Fore.RED + f"    [{d['time']}] {d['type']:<22} "
+                      f"| {d['method']:<28} | {d['ip']}", flush=True)
+
+        print(Fore.CYAN + f"  Blocked IPs : {', '.join(self.blocked_ips) or '(none)'}",
+              flush=True)
+        print(Fore.CYAN + f"{'='*60}\n", flush=True)
+
 
 if __name__ == '__main__':
     pass
