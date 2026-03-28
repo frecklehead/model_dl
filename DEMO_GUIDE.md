@@ -11,7 +11,8 @@ Prepare 5 terminal windows for a professional look:
 3. **Terminal 3: Victim (h1) Traffic**
 4. **Terminal 4: Attacker (h3) Output**
 5. **Terminal 5: Live Stolen Data Monitor**
-.jds
+just ffor commit
+sjgd
 ---
 
 ## STEP 1: PREPARATION & NORMAL TRAFFIC
