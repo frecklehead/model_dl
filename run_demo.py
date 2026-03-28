@@ -11,7 +11,7 @@ from mininet.net import Mininet
 from mininet.node import RemoteController, OVSSwitch
 from mininet.cli import CLI
 from mininet.log import setLogLevel
-import time, os, shutil, subprocess
+import time, os, shutil, subprocess, socket
 
 # Scripts live in a 'scripts/' subfolder next to this file
 _HERE        = os.path.dirname(os.path.abspath(__file__))
@@ -47,6 +47,28 @@ def deploy_scripts():
             print(f"  ✅ /tmp/{fname}")
         else:
             print(f"  ❌ NOT FOUND: {src}")
+
+
+def wait_for_ryu_port(port=6633, timeout=30):
+    """
+    Block until Ryu is actually listening on the port before Mininet starts.
+    If it's not up yet, tell the user clearly instead of silently timing out.
+    """
+    print(f"\n⏳ Checking Ryu is listening on port {port} …")
+    for i in range(timeout):
+        try:
+            with socket.create_connection(('127.0.0.1', port), timeout=1):
+                print(f"  ✅ Ryu is up on port {port}")
+                return True
+        except OSError:
+            if i == 0:
+                print(f"  … Ryu not ready yet. Waiting (up to {timeout}s) …")
+            if i % 5 == 4:
+                print(f"  … {i+1}s elapsed — is ryu-manager running?")
+        time.sleep(1)
+    print(f"  ❌ Ryu not found on port {port} after {timeout}s.")
+    print("     Start it with:  ryu-manager my_controller.py")
+    return False
 
 # ── Controller readiness helpers ───────────────────────
 def _ovs_get(field, target='s1'):
@@ -118,19 +140,37 @@ def check_ping(src_host, dst_ip, label, retries=3):
     return False
 
 def cleanup_orphans():
-    """Kill any leftover background processes from previous runs."""
+    """Kill any leftover background processes and reset OVS state from previous runs."""
     print("🧹 Cleaning up leftover processes ...")
     subprocess.run(['pkill', '-f', 'attacker_mitm.py'], capture_output=True)
     subprocess.run(['pkill', '-f', 'victim_traffic.py'], capture_output=True)
     subprocess.run(['pkill', '-f', 'server_login.py'], capture_output=True)
-    # Also clear any OVS flows that might be hanging
     subprocess.run(['ovs-ofctl', '-O', 'OpenFlow13', 'del-flows', 's1'], capture_output=True)
+    # Clear the stale controller record from any previous run.
+    # If OVS still holds a controller entry with accumulated backoff from a
+    # crashed run, Mininet's net.start() inherits that backoff and waits
+    # several seconds before the first retry.  Removing it here means
+    # net.start() adds the controller fresh — OVS connects on the very
+    # first attempt (no backoff on a brand-new entry).
+    subprocess.run(['ovs-vsctl', 'del-controller', 's1'], capture_output=True)
 
 # ── Main demo ──────────────────────────────────────────
 def run_demo():
     cleanup_orphans()
+
+    # ── GATE 1: confirm Ryu is listening before Mininet even starts ──
+    ryu_up = wait_for_ryu_port(port=6633, timeout=30)
+    if not ryu_up:
+        print("\n  Aborting — start ryu-manager first, then re-run this script.")
+        return
+
     net = create_topology()
     net.start()
+
+    # Cap OVS retry interval at 1s so any missed first attempt recovers fast.
+    # Do NOT del-controller here — Mininet just set it up; touching it breaks things.
+    subprocess.run(['ovs-vsctl', 'set', 'controller', 's1', 'max_backoff=1000'],
+                   capture_output=True)
 
     victim   = net.get('victim')
     server   = net.get('server')
@@ -144,8 +184,8 @@ def run_demo():
     print("🚀 MITM DETECTION DEMO STARTED")
     print("="*60)
 
-    # ── GATE: wait for Ryu before any traffic ─────────────
-    ctrl_ok = wait_for_controller(timeout=45)
+    # ── GATE 2: wait for Ryu to show is_connected=true ────────────────
+    ctrl_ok = wait_for_controller(timeout=15)
     if ctrl_ok:
         wait_for_flows(timeout=20)
     else:
