@@ -134,14 +134,20 @@ def _ovs_get(field, target='s1'):
 
 def wait_for_controller(timeout=15):
     _info(f'Waiting for switch → Ryu connection (up to {timeout}s) ...')
-    for i in range(timeout):
+    steps = timeout * 4          # poll every 0.25s
+    for i in range(steps):
         try:
             if 'true' in _ovs_get('is_connected'):
-                _ok(f'Switch s1 connected to Ryu  ({i}s elapsed)')
+                elapsed = i * 0.25
+                _ok(f'Switch s1 connected to Ryu  ({elapsed:.1f}s)')
                 return True
         except Exception:
             pass
-        time.sleep(1)
+        # Re-kick reconnect every 2 seconds if still not connected
+        if i > 0 and i % 8 == 0:
+            subprocess.run(['ovs-appctl', '-t', 'ovs-vswitchd', 'reconnect'],
+                           capture_output=True)
+        time.sleep(0.25)
     _fail('Switch did not connect within timeout')
     return False
 
@@ -173,9 +179,15 @@ def cleanup_orphans():
     for name in ['attacker_mitm', 'ssl_strip', 'session_hijack',
                  'victim_traffic', 'server_login']:
         subprocess.run(['pkill', '-f', f'{name}.py'], capture_output=True)
-    subprocess.run(['ovs-ofctl', '-O', 'OpenFlow13', 'del-flows', 's1'],
-                   capture_output=True)
-    subprocess.run(['ovs-vsctl', 'del-controller', 's1'], capture_output=True)
+    # Surgical OVS cleanup: only remove stale bridge, don't disturb Ryu
+    subprocess.run(['ovs-vsctl', '--if-exists', 'del-br', 's1'], capture_output=True)
+    # Remove leftover mininet network namespaces
+    r = subprocess.run(['ip', 'netns', 'list'], capture_output=True, text=True)
+    for ns in r.stdout.split():
+        ns = ns.strip()
+        if ns:
+            subprocess.run(['ip', 'netns', 'del', ns], capture_output=True)
+    _ok('Stale OVS state cleared')
 
 # ── Attack utilities ──────────────────────────────────────────────────────────
 def _stop_attacks():
@@ -240,7 +252,7 @@ def attack_arp(victim, server, attacker, device1, device2):
     attacker.cmd('sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1')
     attacker.cmd('iptables -F; iptables -t nat -F; iptables -P FORWARD ACCEPT')
     attacker.cmd('python3 /tmp/attacker_mitm.py 10.0.0.1 10.0.0.2 attacker-eth0 '
-                 '> /tmp/attacker_output.txt 2>&1 &')
+                 '--mode=arp > /tmp/attacker_output.txt 2>&1 &')
     # Script waits 5s internally before relay_flood starts; wait 7s so the
     # victim ARP table is already poisoned when we print it.
     time.sleep(7)
@@ -379,8 +391,8 @@ def attack_dns(victim, server, attacker, device1, device2):
 
     _step(1, 1, 'Launching DNS spoofing from attacker ...')
     attacker.cmd('python3 /tmp/attacker_mitm.py 10.0.0.1 10.0.0.2 attacker-eth0 '
-                 '> /tmp/attacker_output.txt 2>&1 &')
-    # dns_hijack_loop prints a status line every ~22s; give it 30s to log at least once
+                 '--mode=dns > /tmp/attacker_output.txt 2>&1 &')
+    # dns_hijack_loop fires every 2s; give it 30s to trigger divergence
     print(f'  {DM}  (DNS spoof loop fires every 2s; status line printed every ~22s){RS}')
 
     print()
@@ -500,8 +512,15 @@ def run_demo():
     _info('Building Mininet topology ...')
     net = create_topology()
     net.start()
-    subprocess.run(['ovs-vsctl', 'set', 'controller', 's1', 'max_backoff=1000'],
+    # Fast OVS connection: low backoff + short probe + force immediate reconnect
+    subprocess.run(['ovs-vsctl', 'set', 'controller', 's1',
+                    'max_backoff=1000',
+                    'inactivity_probe=5000'],
                    capture_output=True)
+    time.sleep(0.3)
+    subprocess.run(['ovs-appctl', '-t', 'ovs-vswitchd', 'reconnect'],
+                   capture_output=True)
+    _ok('OVS reconnect triggered')
 
     victim   = net.get('victim')
     server   = net.get('server')

@@ -18,6 +18,7 @@ CHANGES FROM v4.0 (honesty fixes):
 
 import os, time, datetime, json, collections, warnings
 import numpy as np
+import pandas as pd
 import joblib
 from tabulate import tabulate
 from colorama import Fore, Back, Style, init
@@ -223,6 +224,7 @@ class MITMController(app_manager.RyuApp):
         self.triggered_alerts = set()
         self.ml_flagged_flows = set()
         self.attack_counts    = collections.defaultdict(int)
+        self._alert_quiet_until = 0   # suppress packet-in logs right after alert
 
         # ip -> {known, forged, attacker_ip, mac, dp, at}
         # Cleared only after an alert fires OR after the 20s window with no evidence
@@ -275,10 +277,12 @@ class MITMController(app_manager.RyuApp):
         if not self.model:
             return None
         try:
-            fd  = flow.get_features()
-            vec = np.array([[fd[f] for f in FEATURES]], dtype=np.float32)
+            fd = flow.get_features()
             if self.scaler:
-                vec = self.scaler.transform(vec)
+                df  = pd.DataFrame([[fd[f] for f in FEATURES]], columns=FEATURES)
+                vec = self.scaler.transform(df).astype(np.float32)
+            else:
+                vec = np.array([[fd[f] for f in FEATURES]], dtype=np.float32)
             vec = vec.reshape(1, len(FEATURES), 1)
             if getattr(self, '_model_is_savedmodel', False):
                 return float(self.model.serve(tf.constant(vec))[0][0])
@@ -290,21 +294,32 @@ class MITMController(app_manager.RyuApp):
     # ── Banner ────────────────────────────────────────────────────────────────
     def _print_banner(self):
         ml = "LOADED" if self.model else "NOT FOUND (rule-based only)"
-        lines = [
-            "=" * 62,
-            f"  MITM DETECTION CONTROLLER v4.1 (HONEST)",
-            f"  ML Model   : {ml}",
-            f"  Features   : {len(FEATURES)}",
-            f"  ML Threshold : {ML_THRESHOLD}  (single value, used everywhere)",
-            "-" * 62,
-            "  ARP Poisoning     : ML MODEL (score>=0.5) -> RULE-BASED if no flows",
-            "  SSL Stripping     : ML MODEL -> RULE-BASED fallback after 20 pkts",
-            "  Session Hijacking : ML MODEL -> RULE-BASED fallback after 20 pkts",
-            "  DNS Hijacking     : RULE-BASED",
-            "=" * 62,
+        W = 66
+        C = Fore.CYAN + Style.BRIGHT
+        R = Style.RESET_ALL
+        print(flush=True)
+        print(C + f"╔{'═'*W}╗" + R, flush=True)
+        print(C + f"║{'MITM DETECTION CONTROLLER v4.1':^{W}}║" + R, flush=True)
+        print(C + f"╠{'═'*W}╣" + R, flush=True)
+        for lbl, val in [("ML Model", ml),
+                         ("Features", str(len(FEATURES))),
+                         ("Threshold", str(ML_THRESHOLD))]:
+            line = f"  {lbl:<14}: {val}"
+            print(C + f"║{line:<{W}}║" + R, flush=True)
+        print(C + f"╠{'═'*W}╣" + R, flush=True)
+        print(C + f"║{'  Detection Methods':<{W}}║" + R, flush=True)
+        print(C + f"║{'─'*W}║" + R, flush=True)
+        methods = [
+            ("ARP Poisoning",     "ML MODEL → RULE-BASED fallback"),
+            ("SSL Stripping",     "ML MODEL → RULE-BASED after 20 pkts"),
+            ("Session Hijacking", "ML MODEL → RULE-BASED after 20 pkts"),
+            ("DNS Hijacking",     "RULE-BASED (response divergence)"),
         ]
-        for l in lines:
-            print(Fore.CYAN + Style.BRIGHT + l, flush=True)
+        for name, desc in methods:
+            line = f"  {name:<22}{desc}"
+            print(C + f"║{line:<{W}}║" + R, flush=True)
+        print(C + f"╚{'═'*W}╝" + R, flush=True)
+        print(flush=True)
 
     # ── Datapath management ───────────────────────────────────────────────────
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
@@ -330,14 +345,21 @@ class MITMController(app_manager.RyuApp):
         self.mac_to_port.pop(dp.id, None)
 
         ts = datetime.datetime.now().strftime('%H:%M:%S')
-        print(Fore.GREEN + Style.BRIGHT +
-              f"\n[{ts}] *** Switch CONNECTED: dpid={dp.id} ***", flush=True)
+        G = Fore.GREEN + Style.BRIGHT
+        R = Style.RESET_ALL
+        W = 50
+        print(flush=True)
+        print(G + f"  ┌{'─'*W}┐" + R, flush=True)
+        print(G + f"  │{'  ✓ SWITCH CONNECTED':^{W}}│" + R, flush=True)
+        print(G + f"  │{f'    dpid={dp.id}  |  OF1.3  |  {ts}':^{W}}│" + R, flush=True)
+        print(G + f"  └{'─'*W}┘" + R, flush=True)
 
         match   = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                           ofproto.OFPCML_NO_BUFFER)]
         self._add_flow(dp, 0, match, actions)
-        print(f"[{ts}]   Table-miss flow installed.", flush=True)
+        print(G + f"  Table-miss flow installed — all packets → controller" + R, flush=True)
+        print(flush=True)
 
     def _add_flow(self, dp, priority, match, actions):
         parser  = dp.ofproto_parser
@@ -457,14 +479,18 @@ class MITMController(app_manager.RyuApp):
         else:
             label = "IP"
 
-        # Neat log for packet-in
+        # Suppress noisy packet-in logs right after an alert so the box stays visible
+        quiet = time.time() < self._alert_quiet_until
+
+        # Neat log for packet-in (skipped during quiet period)
         color = Fore.LIGHTBLACK_EX
         if "HTTP" in label: color = Fore.GREEN
         elif "DNS" in label: color = Fore.YELLOW
         elif "UDP" in label: color = Fore.BLUE
         elif "TCP" in label: color = Fore.CYAN
 
-        print(f"[{ts}] {color}{Style.BRIGHT}[{label:<5}]{Style.NORMAL} {src_ip}:{src_port} \u2794 {dst_ip}:{dst_port}", flush=True)
+        if not quiet:
+            print(f"[{ts}] {color}{Style.BRIGHT}[{label:<5}]{Style.NORMAL} {src_ip}:{src_port} \u2794 {dst_ip}:{dst_port}", flush=True)
 
         key = tuple(sorted([(src_ip, src_port), (dst_ip, dst_port)])) + (proto,)
         if key not in self.flows:
@@ -492,7 +518,7 @@ class MITMController(app_manager.RyuApp):
                 continue
             if key in self.ml_flagged_flows:
                 continue
-            if flow.total_packets < 3:
+            if flow.total_packets < 15:
                 continue
             self._run_ml_on_flow(key, flow, ts, dp, src_mac)
 
@@ -540,9 +566,10 @@ class MITMController(app_manager.RyuApp):
             self._trigger_alert(attack_type, alert_ip, alert_mac, dp,
                                 "ML MODEL (CNN+LSTM)", detail)
         else:
-            # Subtle log for normal ML scan
-            print(Fore.WHITE + Style.DIM + f"[{ts}] [ML SCAN ] {flow.src_ip} \u2794 {flow.dst_ip} "
-                  f"| pkts={flow.total_packets} | score={score:.4f} \u2714", flush=True)
+            # Subtle log for normal ML scan (suppressed during alert quiet period)
+            if time.time() >= self._alert_quiet_until:
+                print(Fore.WHITE + Style.DIM + f"[{ts}] [ML SCAN ] {flow.src_ip} \u2794 {flow.dst_ip} "
+                      f"| pkts={flow.total_packets} | score={score:.4f} \u2714", flush=True)
 
     # ── Rule-based fallback for SSL strip / session hijack ────────────────────
     def _rule_fallback(self, flow, ts, dp, src_mac):
@@ -578,6 +605,7 @@ class MITMController(app_manager.RyuApp):
                 pos += 1 + ln
             domain = '.'.join(parts) or f'?@{src_ip}'
             self.dns_responses.setdefault(domain, set()).add(src_ip)
+
             if len(self.dns_responses[domain]) > 1:
                 ips    = ', '.join(sorted(self.dns_responses[domain]))
                 detail = f"domain '{domain}' -> multiple IPs: [{ips}]"
@@ -614,29 +642,37 @@ class MITMController(app_manager.RyuApp):
         }
         how = HOW.get(method, {}).get(attack_type, f"{method} detection triggered")
 
-        W = 64
+        W = 66
+        A = Fore.RED + Style.BRIGHT
+        R = Style.RESET_ALL
         def _col(label, value):
-            s = label + value
+            s = f"  {label}{value}"
             if len(s) > W:
                 s = s[:W-2] + ".."
-            return f"|  {s:<{W}}|"
+            return f"║{s:<{W}}║"
 
-        sep  = "=" * 66
-        dash = "-" * 66
-        print(flush=True)
-        print(Fore.RED + Style.BRIGHT + f"+{sep}+", flush=True)
-        print(Fore.RED + Style.BRIGHT + f"|{'  *** MITM ATTACK DETECTED ***':<66}|", flush=True)
-        print(Fore.RED + Style.BRIGHT + f"+{dash}+", flush=True)
-        print(Fore.RED + Style.BRIGHT + _col("Attack Type : ", attack_type), flush=True)
-        print(Fore.RED + Style.BRIGHT + _col("Method      : ", method), flush=True)
-        print(Fore.RED + Style.BRIGHT + _col("How         : ", how), flush=True)
-        print(Fore.RED + Style.BRIGHT + _col("Time        : ", ts), flush=True)
-        print(Fore.RED + Style.BRIGHT + _col("Host IP     : ", ip), flush=True)
-        print(Fore.RED + Style.BRIGHT + _col("MAC         : ", mac), flush=True)
-        print(Fore.RED + Style.BRIGHT + _col("Details     : ", detail), flush=True)
-        print(Fore.RED + Style.BRIGHT + _col("Action      : ", "IP and MAC blocked — DROP rules installed"), flush=True)
-        print(Fore.RED + Style.BRIGHT + f"+{sep}+", flush=True)
-        print(flush=True)
+        print("\n\n", flush=True)
+        print(A + f"╔{'═'*W}╗" + R, flush=True)
+        print(A + f"║{'':^{W}}║" + R, flush=True)
+        print(A + f"║{'⚠  MITM ATTACK DETECTED  ⚠':^{W}}║" + R, flush=True)
+        print(A + f"║{'':^{W}}║" + R, flush=True)
+        print(A + f"╠{'═'*W}╣" + R, flush=True)
+        print(A + _col("Attack Type : ", attack_type) + R, flush=True)
+        print(A + _col("Method      : ", method) + R, flush=True)
+        print(A + _col("How         : ", how) + R, flush=True)
+        print(A + _col("Time        : ", ts) + R, flush=True)
+        print(A + _col("Host IP     : ", ip) + R, flush=True)
+        print(A + _col("MAC         : ", mac) + R, flush=True)
+        print(A + f"╠{'─'*W}╣" + R, flush=True)
+        print(A + _col("Details     : ", detail) + R, flush=True)
+        print(A + _col("Action      : ", "IP and MAC blocked — DROP rules installed") + R, flush=True)
+        print(A + f"╚{'═'*W}╝" + R, flush=True)
+        # Sticky one-liner that stays visible even as logs scroll
+        print(A + f"  >>> {attack_type} DETECTED — {ip} ({mac}) BLOCKED <<<" + R, flush=True)
+        print("\n", flush=True)
+
+        # Suppress noisy packet-in logs for 5s so the alert box stays on screen
+        self._alert_quiet_until = time.time() + 5
 
         self.detections.append({
             "time": ts, "type": attack_type, "method": method,
@@ -735,28 +771,46 @@ class MITMController(app_manager.RyuApp):
 
     def _print_stats(self):
         ts = datetime.datetime.now().strftime('%H:%M:%S')
-        print(Fore.CYAN + f"\n{'='*60} [{ts}]", flush=True)
-        print(Fore.CYAN + f"  Switches: {len(self.datapaths)}  "
-              f"Flows: {len(self.flows)}  "
-              f"ARP entries: {len(self.arp_table)}", flush=True)
+        C = Fore.CYAN + Style.BRIGHT
+        D = Fore.CYAN
+        R = Style.RESET_ALL
+        W = 60
 
-        # Explicitly show all attack types in summary
-        print(Fore.CYAN + "  Attack Statistics:", flush=True)
+        print(flush=True)
+        print(C + f"┌{'─'*W}┐" + R, flush=True)
+        print(C + f"│{f'  STATUS REPORT  [{ts}]':^{W}}│" + R, flush=True)
+        print(C + f"├{'─'*W}┤" + R, flush=True)
+        info = f"  Switches: {len(self.datapaths)}   Flows: {len(self.flows)}   ARP: {len(self.arp_table)}"
+        print(D + f"│{info:<{W}}│" + R, flush=True)
+        print(C + f"├{'─'*W}┤" + R, flush=True)
+        print(C + f"│{'  ATTACK STATISTICS':<{W}}│" + R, flush=True)
+
         all_types = ["ARP POISONING", "DNS HIJACKING", "SSL STRIPPING", "SESSION HIJACKING"]
         for atype in all_types:
             count = self.attack_counts.get(atype, 0)
-            color = Fore.RED if count > 0 else Fore.CYAN
-            print(color + f"    {atype:<26}: {count}", flush=True)
+            if count > 0:
+                mark = Fore.RED + Style.BRIGHT + f"  ● {atype:<24} {count} detected"
+            else:
+                mark = D + f"  ○ {atype:<24} —"
+            print(mark + ' ' * (W - len(f"  ● {atype:<24} {count} detected")) + D + "│" + R, flush=True)
 
         if self.detections:
-            print(Fore.CYAN + "  Recent detections:", flush=True)
+            print(C + f"├{'─'*W}┤" + R, flush=True)
+            print(C + f"│{'  RECENT ALERTS':<{W}}│" + R, flush=True)
             for d in self.detections[-5:]:
-                print(Fore.RED + f"    [{d['time']}] {d['type']:<22} "
-                      f"| {d['method']:<28} | {d['ip']}", flush=True)
+                line = f"  [{d['time']}] {d['type']:<20} {d['method']:<26} {d['ip']}"
+                if len(line) > W:
+                    line = line[:W-2] + ".."
+                print(Fore.RED + Style.BRIGHT + f"│{line:<{W}}│" + R, flush=True)
 
-        print(Fore.CYAN + f"  Blocked IPs : {', '.join(self.blocked_ips) or '(none)'}",
-              flush=True)
-        print(Fore.CYAN + f"{'='*60}\n", flush=True)
+        blk = ', '.join(self.blocked_ips) or '(none)'
+        print(C + f"├{'─'*W}┤" + R, flush=True)
+        bline = f"  Blocked IPs: {blk}"
+        if len(bline) > W:
+            bline = bline[:W-2] + ".."
+        print(D + f"│{bline:<{W}}│" + R, flush=True)
+        print(C + f"└{'─'*W}┘" + R, flush=True)
+        print(flush=True)
 
 
 if __name__ == '__main__':
