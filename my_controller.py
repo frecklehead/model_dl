@@ -605,7 +605,7 @@ class MITMController(app_manager.RyuApp):
             },
             "RULE-BASED": {
                 "ARP POISONING":  "ARP reply changed IP->MAC mapping; no scorable flows available",
-                "DNS HIJACKING":  "Same domain resolved to different IPs by different servers",
+                "DNS HIJACKING":  "Domain resolved to a different IP than previous records (DNS Response Divergence)",
             },
             "RULE-BASED FALLBACK": {
                 "SSL STRIPPING":     "TCP flow to 443/8443 seen 20+ pkts; ML score below 0.5",
@@ -740,10 +740,13 @@ class MITMController(app_manager.RyuApp):
               f"Flows: {len(self.flows)}  "
               f"ARP entries: {len(self.arp_table)}", flush=True)
 
-        if self.attack_counts:
-            print(Fore.CYAN + "  Attack counts:", flush=True)
-            for atype, cnt in sorted(self.attack_counts.items()):
-                print(Fore.CYAN + f"    {atype:<26}: {cnt}", flush=True)
+        # Explicitly show all attack types in summary
+        print(Fore.CYAN + "  Attack Statistics:", flush=True)
+        all_types = ["ARP POISONING", "DNS HIJACKING", "SSL STRIPPING", "SESSION HIJACKING"]
+        for atype in all_types:
+            count = self.attack_counts.get(atype, 0)
+            color = Fore.RED if count > 0 else Fore.CYAN
+            print(color + f"    {atype:<26}: {count}", flush=True)
 
         if self.detections:
             print(Fore.CYAN + "  Recent detections:", flush=True)
