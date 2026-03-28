@@ -16,7 +16,7 @@ CHANGES FROM v4.0 (honesty fixes):
     not as a consolation prize for a low-scoring flow
 """
 
-import os, time, datetime, json, collections
+import os, time, datetime, json, collections, warnings
 import numpy as np
 import joblib
 from tabulate import tabulate
@@ -31,6 +31,7 @@ from ryu.lib.packet import packet, ethernet, arp, ipv4, tcp, udp, ether_types
 from ryu.lib import hub
 
 init(autoreset=True)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 try:
     import tensorflow as tf
@@ -385,18 +386,18 @@ class MITMController(app_manager.RyuApp):
 
     # ── ARP handler ───────────────────────────────────────────────────────────
     def _handle_arp(self, dp, in_port, pkt_arp, eth, ts):
-        op      = "REQUEST" if pkt_arp.opcode == arp.ARP_REQUEST else "REPLY"
+        op      = "RQ" if pkt_arp.opcode == arp.ARP_REQUEST else "RP"
         src_ip  = pkt_arp.src_ip
         src_mac = eth.src
-        print(f"[{ts}] [ARP  ] {op:<8} {src_ip} ({src_mac}) -> {pkt_arp.dst_ip}",
-              flush=True)
+        color   = Fore.MAGENTA if op == "RP" else Fore.LIGHTMAGENTA_EX
+        print(f"[{ts}] {color}{Style.BRIGHT}[ARP {op}]{Style.NORMAL} {src_ip} ({src_mac}) \u2794 {pkt_arp.dst_ip}", flush=True)
 
         if src_ip in self.arp_table:
             known = self.arp_table[src_ip]
             if known != src_mac:
                 # ── ARP CONFLICT DETECTED ──────────────────────────────────
                 self.arp_conflicts[src_ip] = (known, src_mac)
-                print(f"[{ts}] [ARP  ] *** CONFLICT: {src_ip} "
+                print(Fore.RED + Style.BRIGHT + f"[{ts}] [ARP!! ] *** CONFLICT: {src_ip} "
                       f"known={known} forged={src_mac} ***", flush=True)
 
                 attacker_ip = next(
@@ -447,18 +448,23 @@ class MITMController(app_manager.RyuApp):
             src_port = pkt_tcp.src_port
             dst_port = pkt_tcp.dst_port
             flags    = pkt_tcp.bits
-            label    = ("HTTP " if dst_port in (80, 443, 8080)
-                        or src_port in (80, 443, 8080) else "TCP  ")
+            label    = "HTTP" if dst_port in (80, 443, 8080) or src_port in (80, 443, 8080) else "TCP"
         elif pkt_udp:
             src_port = pkt_udp.src_port
             dst_port = pkt_udp.dst_port
-            label    = "DNS  " if DNS_PORT in (src_port, dst_port) else "UDP  "
+            label    = "DNS" if DNS_PORT in (src_port, dst_port) else "UDP"
             self._check_dns(pkt_udp, src_ip, dst_ip, eth.src, ts, dp)
         else:
-            label = "IP   "
+            label = "IP"
 
-        print(f"[{ts}] [{label}] {src_ip}:{src_port} -> {dst_ip}:{dst_port}",
-              flush=True)
+        # Neat log for packet-in
+        color = Fore.LIGHTBLACK_EX
+        if "HTTP" in label: color = Fore.GREEN
+        elif "DNS" in label: color = Fore.YELLOW
+        elif "UDP" in label: color = Fore.BLUE
+        elif "TCP" in label: color = Fore.CYAN
+
+        print(f"[{ts}] {color}{Style.BRIGHT}[{label:<5}]{Style.NORMAL} {src_ip}:{src_port} \u2794 {dst_ip}:{dst_port}", flush=True)
 
         key = tuple(sorted([(src_ip, src_port), (dst_ip, dst_port)])) + (proto,)
         if key not in self.flows:
@@ -529,13 +535,14 @@ class MITMController(app_manager.RyuApp):
                 alert_mac = src_mac
 
             detail = f"score={score:.4f} | {sub_detail}"
-            print(f"[{ts}] [ML   ] DETECTED {attack_type} "
-                  f"{flow.src_ip}->{flow.dst_ip} score={score:.4f}", flush=True)
+            print(Fore.RED + Style.BRIGHT + f"[{ts}] [ML ALERT] {attack_type} "
+                  f"CONFIRMED on {flow.src_ip} \u2794 {flow.dst_ip} | score={score:.4f}", flush=True)
             self._trigger_alert(attack_type, alert_ip, alert_mac, dp,
                                 "ML MODEL (CNN+LSTM)", detail)
         else:
-            print(f"[{ts}] [ML   ] {flow.src_ip}->{flow.dst_ip} "
-                  f"pkts={flow.total_packets} score={score:.4f} NORMAL", flush=True)
+            # Subtle log for normal ML scan
+            print(Fore.WHITE + Style.DIM + f"[{ts}] [ML SCAN ] {flow.src_ip} \u2794 {flow.dst_ip} "
+                  f"| pkts={flow.total_packets} | score={score:.4f} \u2714", flush=True)
 
     # ── Rule-based fallback for SSL strip / session hijack ────────────────────
     def _rule_fallback(self, flow, ts, dp, src_mac):
@@ -692,8 +699,8 @@ class MITMController(app_manager.RyuApp):
                 if score is None:
                     continue
                 flow.last_score = score
-                print(f"[{ts}] [ML   ] Final ARP scan: {flow.src_ip}->{flow.dst_ip} "
-                      f"pkts={flow.total_packets} score={score:.4f}", flush=True)
+                print(Fore.WHITE + Style.DIM + f"[{ts}] [ML SCAN ] (ARP Final) {flow.src_ip} \u2794 {flow.dst_ip} "
+                      f"| pkts={flow.total_packets} | score={score:.4f}", flush=True)
                 if score > best_score:
                     best_score, best_flow = score, flow
 
