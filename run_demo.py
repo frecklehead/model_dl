@@ -37,7 +37,7 @@ def create_topology():
 def deploy_scripts():
     """Copy scripts/ → /tmp/ (all Mininet hosts share the root filesystem)."""
     print("\n📂 Deploying scripts to /tmp ...")
-    for fname in ['attacker_mitm.py', 'victim_traffic.py', 'server_login.py',
+    for fname in ['attacker_mitm.py', 'enhanced_mitm.py', 'robust_attack.py', 'victim_traffic.py', 'server_login.py',
                   'ssl_strip.py', 'session_hijack.py']:
         src = os.path.join(SCRIPTS_DIR, fname)
         dst = f'/tmp/{fname}'
@@ -257,13 +257,13 @@ def run_demo():
     time.sleep(10)  # RST injection takes ~8s for 30 packets
     print(f"   Log: {device2.cmd('tail -5 /tmp/session_hijack_output.txt | strings 2>/dev/null').strip()}")
 
-    # ── Phase 6: ARP Poisoning MITM (attacker) ───────────
-    print(f"\n🔴 Phase 6: ARP Poisoning MITM (interface={attacker_iface}) ...")    
+    # ── Phase 6: Enhanced ARP Poisoning MITM (attacker) ───────────
+    print(f"\n🔴 Phase 6: Enhanced ARP Poisoning MITM (Tailored to ML Features) ...")    
     attacker.cmd('sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1')
     attacker.cmd('iptables -F; iptables -t nat -F; iptables -P FORWARD ACCEPT')
     # Pass: victim_ip  server_ip  interface_name
     attacker.cmd(
-        f'python3 /tmp/attacker_mitm.py 10.0.0.1 10.0.0.2 {attacker_iface} '
+        f'python3 /tmp/enhanced_mitm.py 10.0.0.1 10.0.0.2 {attacker_iface} '
         f'> /tmp/attacker_output.txt 2>&1 &'
     )
     time.sleep(5)
@@ -275,26 +275,32 @@ def run_demo():
     print("Attacker startup log:")
     print(attacker.cmd('head -30 /tmp/attacker_output.txt 2>/dev/null'))
 
-    # ── Phase 5: Victim sends credentials ─────────────────
-    print("\n💀 Phase 5: Victim sending credentials (being stolen) …")
-    # victim_traffic.py accepts SERVER_IP as optional first arg
+    # ── Phase 7: Robust Attack (attacker) ───────────
+    print(f"\n⚡ Phase 7: Robust MITM Attack (Designed to evade simple thresholds) ...")
+    attacker.cmd(f'python3 /tmp/robust_attack.py > /tmp/robust_output.txt 2>&1 &')
+    time.sleep(10)
+    print("   Robust attack generates variable flow parameters to challenge ML robustness...")
+
+    # ── Phase 8: Victim sends credentials ─────────────────
+    print("\n💀 Phase 8: Victim sending credentials (being stolen by robust attack) …")
     victim.cmd('python3 /tmp/victim_traffic.py 10.0.0.2 > /tmp/victim_output.txt 2>&1 &')
     time.sleep(6)
 
-    # ── Phase 6: Confirm theft ─────────────────────────────
-    print("\n🔍 Phase 6: Checking stolen credentials …")
-    stolen = attacker.cmd('cat /tmp/mitm_stolen.txt 2>/dev/null || echo "(empty)"')
-    if 'username' in stolen or 'password' in stolen:
-        print(f"🚨 CREDENTIALS STOLEN:\n{stolen[:500]}")
+    # ── Phase 9: Confirm theft ─────────────────────────────
+    print("\n🔍 Phase 9: Checking stolen credentials …")
+    stolen = attacker.cmd('cat /tmp/robust_mitm_stolen.txt 2>/dev/null || echo "(empty)"')
+    if 'ROBUST' in stolen or 'STOLEN' in stolen or 'SNIFF' in stolen:
+        print(f"🚨 CREDENTIALS STOLEN BY ROBUST ATTACK:\n{stolen[:500]}")
     else:
-        print(f"⏳ Nothing yet. Attacker log tail:\n"
-              f"{attacker.cmd('tail -20 /tmp/attacker_output.txt 2>/dev/null')}")
+        print(f"⏳ Nothing yet from robust attack. Attacker log tail:\n"
+              f"{attacker.cmd('tail -10 /tmp/robust_output.txt 2>/dev/null')}")
 
-    # ── Phase 7: Detection summary ─────────────────────────
-    print("\n🛡️  Phase 7: Check Ryu terminal for:")
-    print("     [ML] ARP POISONING   — detected by ML model (flow anomaly + ARP conflict)")
-    print("     [ML] SSL STRIPPING   — detected by ML model (or rule fallback if ML misses)")
-    print("     [ML] SESSION HIJACK  — detected by ML model (or rule fallback if ML misses)")
+    # ── Phase 10: Detection summary ─────────────────────────
+    print("\n🛡️  Phase 10: Check Ryu terminal for:")
+    print("     [ML] ARP POISONING (ROBUST) — detected by ensemble models")
+    print("     [ML] ARP POISONING (BASIC)  — detected by ML model")
+    print("     [ML] SSL STRIPPING          — detected by ML model")
+    print("     [ML] SESSION HIJACK         — detected by ML model")
 
     print("\n" + "="*60)
     print("📊 DEMO COMPLETE — Interactive CLI open")
