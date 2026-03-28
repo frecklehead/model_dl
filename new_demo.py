@@ -10,9 +10,10 @@ Attack sequence:
   Phase 4 — SSL Stripping attack from device1 → server:443
   Phase 5 — Session Hijacking via RST injection from device2
   Phase 6 — ARP Poisoning MITM from attacker (attacker_mitm.py)
-             └── Internal modules: ARP poison, relay flood, session hijack,
-                 SSL strip RST, DNS hijack, credential interception
-             └── Built-in 5s delay before relay flood — demo waits for it
+             └── Internal modules: ARP poison, transparent L2 relay,
+                 seq-tracking session hijack, real SSL strip proxy,
+                 query-triggered DNS spoof, credential interception
+             └── Waits 5s for ARP cache before starting relay modules
   Phase 7 — Victim sends credentials (attacker should already be poisoned)
   Phase 8 — Confirm credential theft and check Ryu detection log
 """
@@ -264,16 +265,16 @@ def run_demo():
         '-j REDIRECT --to-ports 10000 2>/dev/null'
     )
 
-    # Launch attacker_mitm.py — it runs its own internal 5s delay before
-    # relay flood starts, so we wait 5s (ARP propagation) + 5s (internal
-    # delay) + 5s (buffer) = 15s before declaring it ready
+    # Launch attacker_mitm.py — it resolves MACs then waits 5s for ARP
+    # to propagate before starting the transparent relay and other modules.
+    # We wait 15s total: 5s (ARP propagation) + 5s (internal delay) + 5s buffer.
     attacker.cmd(
         f'python3 /tmp/attacker_mitm.py 10.0.0.1 10.0.0.2 {attacker_iface} '
         f'> /tmp/attacker_output.txt 2>&1 &'
     )
 
-    print("  ⏳ Waiting 15s for ARP poison to propagate and relay flood to begin …")
-    print("     (attacker_mitm.py has a built-in 5s delay before relay traffic starts)")
+    print("  ⏳ Waiting 15s for ARP poison to propagate and attack modules to start …")
+    print("     (attacker_mitm.py waits 5s internally for ARP cache to update)")
     time.sleep(15)
 
     print("\n  Attacker startup log:")
@@ -320,11 +321,12 @@ def run_demo():
 
     # ── Phase 8: Detection summary ─────────────────────────
     print("\n🛡️  Phase 8: Expected Ryu detection events:")
-    print("     [RULE] ARP POISONING   — ARP conflict: 10.0.0.2 claimed by 00:00:00:00:00:03")
-    print("     [ML]   ARP POISONING   — relay flood: low piat_cv + packet/byte asymmetry")
-    print("     [RULE] DNS HIJACKING   — test.local → two different IPs from two sources")
-    print("     [RULE] SSL STRIPPING   — port 443 flow + RST ratio > threshold (attacker + device1)")
-    print("     [RULE/ML] SESSION HIJ  — RST ratio > 0.15 + ACK count > 5 (attacker + device2)")
+    print("     [RULE] ARP POISONING     — MAC/IP binding conflict: 10.0.0.2 claimed by 00:00:00:00:00:03")
+    print("     [RULE] TRANSPARENT RELAY — ingress port anomaly: victim IP arriving on attacker's port")
+    print("     [ML]   ARP/RELAY         — port_anomaly + mac_ip_mismatch features scored by model")
+    print("     [RULE] DNS HIJACKING     — response timing < 2ms threshold (on-path spoof)")
+    print("     [RULE] SSL STRIPPING     — port 443 + no TLS completion (device1 + attacker proxy)")
+    print("     [RULE] SESSION HIJACKING — RST ratio > 0.15 + real seq injection (device2 + attacker)")
 
     print("\n" + "="*60)
     print("📊 DEMO COMPLETE — Interactive CLI open")
