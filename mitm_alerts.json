@@ -25,5 +25,32 @@
     "ip": "10.0.0.12",
     "mac": "00:00:00:00:00:12",
     "detail": "RST ratio=0.50 ACKs=10 pkts=20 ML score=0.0000 (<0.5)"
+  },
+  {
+    "timestamp": "13:58:08",
+    "attack_type": "ARP POISONING",
+    "method": "ML MODEL (CNN+LSTM)",
+    "how": "CNN+LSTM score >=0.5 on flow from ARP-conflicted host",
+    "ip": "10.0.0.100",
+    "mac": "00:00:00:00:00:03",
+    "detail": "score=0.9149 | score=0.9149 | ARP conflict on 10.0.0.2 known=00:00:00:00:00:02 forged=00:00:00:00:00:03"
+  },
+  {
+    "timestamp": "14:00:35",
+    "attack_type": "SSL STRIPPING",
+    "method": "RULE-BASED FALLBACK",
+    "how": "443/8443 flow reached 20+ pkts; ML score below threshold",
+    "ip": "10.0.0.11",
+    "mac": "00:00:00:00:00:11",
+    "detail": "TLS port 443 pkts=20 ML score=0.0034 (<0.5)"
+  },
+  {
+    "timestamp": "14:01:31",
+    "attack_type": "SESSION HIJACKING",
+    "method": "RULE-BASED FALLBACK",
+    "how": "RST ratio>15% + ACK count>5 after 20+ pkts; ML below threshold",
+    "ip": "10.0.0.12",
+    "mac": "00:00:00:00:00:12",
+    "detail": "RST ratio=0.50 ACKs=10 pkts=20 ML score=0.0677 (<0.5)"
   }
 ]
