@@ -47,8 +47,12 @@ st.markdown("""
     }
     div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
         font-family: 'JetBrains Mono', monospace !important;
-        font-size: 2rem !important;
-        font-weight: 700;
+        font-size: 2.2rem !important;
+        font-weight: 800 !important;
+        color: #f0f6fc !important;
+    }
+    div[data-testid="stMetric"] div[data-testid="stMetricValue"] > div {
+        color: #f0f6fc !important;
     }
 
     /* Alert card styling */
@@ -293,14 +297,19 @@ with tab_live:
             with col:
                 if count > 0:
                     st.markdown(f"""
-                    <div style="background:linear-gradient(135deg, {color}15, {color}08);
-                                border:1px solid {color}66; border-radius:12px;
-                                padding:20px; text-align:center;">
+                    <div style="background:linear-gradient(135deg, {color}25, {color}10);
+                                border:1px solid {color}; border-radius:12px;
+                                padding:20px; text-align:center;
+                                box-shadow: 0 0 20px {color}33;">
                         <div style="font-size:2.5rem;">{icon}</div>
                         <div style="color:{color}; font-size:1.1rem; font-weight:700;
-                                    margin:8px 0;">{atype}</div>
-                        <div style="color:white; font-size:2.2rem; font-weight:700;">{count}</div>
-                        <div style="color:#8b949e; font-size:0.8rem; margin-top:4px;">
+                                    margin:8px 0; text-shadow: 0 0 8px {color}66;">{atype}</div>
+                        <div style="color:{color}; font-size:3.2rem; font-weight:900;
+                                    font-family: 'JetBrains Mono', monospace;
+                                    text-shadow: 0 0 14px {color}99, 0 0 4px #ffffff44;
+                                    line-height:1.1;">{count}</div>
+                        <div style="color:#c9d1d9; font-size:0.85rem; font-weight:700;
+                                    letter-spacing:1.5px; margin-top:6px;">
                             DETECTED
                         </div>
                     </div>
@@ -312,8 +321,11 @@ with tab_live:
                         <div style="font-size:2.5rem; opacity:0.3;">{icon}</div>
                         <div style="color:#8b949e; font-size:1rem; font-weight:600;
                                     margin:8px 0;">{atype}</div>
-                        <div style="color:#30363d; font-size:2.2rem; font-weight:700;">0</div>
-                        <div style="color:#30363d; font-size:0.8rem; margin-top:4px;">
+                        <div style="color:#6e7681; font-size:3.2rem; font-weight:900;
+                                    font-family: 'JetBrains Mono', monospace;
+                                    line-height:1.1;">0</div>
+                        <div style="color:#6e7681; font-size:0.85rem; font-weight:700;
+                                    letter-spacing:1.5px; margin-top:6px;">
                             NO DETECTION
                         </div>
                     </div>

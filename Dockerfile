@@ -26,11 +26,13 @@ RUN pip install --no-cache-dir git+https://github.com/faucetsdn/ryu.git
 # Re-enforce eventlet version to prevent Ryu from downgrading it during its own installation
 RUN pip install --no-cache-dir eventlet==0.36.1 dnspython==2.2.1
 
-# Install lightweight ML and networking libraries only.
-# TensorFlow is intentionally excluded from the Docker image to keep it small.
-# The controller handles this gracefully: ML detection is disabled if TF is absent,
-# while ARP-based rule detection continues to work normally.
-RUN pip install --no-cache-dir numpy pandas joblib requests tabulate colorama scikit-learn
+# Install ML and networking libraries.
+# TensorFlow is required so the controller can load the CNN+LSTM model
+# and run ML-based detection for ARP poisoning, SSL stripping, and session hijacking.
+# tensorflow-cpu was discontinued for Python 3.10; use plain tensorflow (uses CPU
+# automatically when no CUDA runtime is present).
+RUN pip install --no-cache-dir numpy pandas joblib requests tabulate colorama scikit-learn \
+    && pip install --no-cache-dir tensorflow==2.15.0
 
 # Create working directory
 WORKDIR /app
