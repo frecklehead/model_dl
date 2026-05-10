@@ -1,0 +1,11 @@
+{
+  "timestamp": "09:14:14",
+  "switches": 0,
+  "active_flows": 0,
+  "arp_entries": 0,
+  "attack_counts": {},
+  "blocked_ips": [],
+  "blocked_macs": [],
+  "detections": [],
+  "flows": []
+}
