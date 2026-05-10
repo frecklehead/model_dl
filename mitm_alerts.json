@@ -1,0 +1,29 @@
+[
+  {
+    "timestamp": "09:09:08",
+    "attack_type": "ARP POISONING",
+    "method": "RULE-BASED",
+    "how": "ARP reply changed IP\u2192MAC mapping; no scorable flows",
+    "ip": "10.0.0.100",
+    "mac": "00:00:00:00:00:03",
+    "detail": "ARP conflict: 10.0.0.1 known=00:00:00:00:00:01 forged=00:00:00:00:00:03 | ML not loaded"
+  },
+  {
+    "timestamp": "09:10:25",
+    "attack_type": "SSL STRIPPING",
+    "method": "RULE-BASED FALLBACK",
+    "how": "443/8443 flow reached 20+ pkts; ML score below threshold",
+    "ip": "10.0.0.11",
+    "mac": "00:00:00:00:00:11",
+    "detail": "TLS port 443 pkts=20 ML score=0.0000 (<0.5)"
+  },
+  {
+    "timestamp": "09:11:09",
+    "attack_type": "SESSION HIJACKING",
+    "method": "RULE-BASED FALLBACK",
+    "how": "RST ratio>15% + ACK count>5 after 20+ pkts; ML below threshold",
+    "ip": "10.0.0.12",
+    "mac": "00:00:00:00:00:12",
+    "detail": "RST ratio=0.50 ACKs=10 pkts=20 ML score=0.0000 (<0.5)"
+  }
+]

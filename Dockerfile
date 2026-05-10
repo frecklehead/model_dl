@@ -30,7 +30,7 @@ RUN pip install --no-cache-dir eventlet==0.36.1 dnspython==2.2.1
 # TensorFlow is intentionally excluded from the Docker image to keep it small.
 # The controller handles this gracefully: ML detection is disabled if TF is absent,
 # while ARP-based rule detection continues to work normally.
-RUN pip install --no-cache-dir numpy joblib requests tabulate colorama scikit-learn
+RUN pip install --no-cache-dir numpy pandas joblib requests tabulate colorama scikit-learn
 
 # Create working directory
 WORKDIR /app

@@ -782,7 +782,7 @@ class MITMController(app_manager.RyuApp):
         self.blocked_ips.add(ip)
 
         try:
-            log_path = "/tmp/mitm_alerts.json"
+            log_path = "/app/mitm_alerts.json" if os.path.exists("/app") else "mitm_alerts.json"
             try:
                 existing = json.loads(open(log_path).read() or '[]')
             except Exception:
@@ -899,6 +899,34 @@ class MITMController(app_manager.RyuApp):
         print(D + f"│{bline[:W]:<{W}}│" + R, flush=True)
         print(C + f"└{'─'*W}┘" + R, flush=True)
         print(flush=True)
+
+        # ── Write live status for GUI dashboard ──────────────────────────────
+        try:
+            status = {
+                "timestamp": ts,
+                "switches": len(self.datapaths),
+                "active_flows": len(self.flows),
+                "arp_entries": len(self.arp_table),
+                "attack_counts": dict(self.attack_counts),
+                "blocked_ips": list(self.blocked_ips),
+                "blocked_macs": list(self.blocked_macs),
+                "detections": self.detections[-50:],
+                "flows": [],
+            }
+            for key, flow in list(self.flows.items())[-100:]:
+                status["flows"].append({
+                    "src_ip": flow.src_ip, "dst_ip": flow.dst_ip,
+                    "src_port": flow.src_port, "dst_port": flow.dst_port,
+                    "protocol": flow.protocol,
+                    "packets": flow.total_packets,
+                    "s2d_bytes": flow.s2d_bytes, "d2s_bytes": flow.d2s_bytes,
+                    "score": round(flow.last_score, 4),
+                    "is_mitm": flow.is_mitm,
+                })
+            status_path = "/app/mitm_status.json" if os.path.exists("/app") else "mitm_status.json"
+            open(status_path, "w").write(json.dumps(status, indent=2))
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
