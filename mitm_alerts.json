@@ -61,5 +61,68 @@
     "ip": "10.0.0.100",
     "mac": "00:00:00:00:00:03",
     "detail": "score=0.5688 | score=0.5688 | ARP conflict on 10.0.0.2 known=00:00:00:00:00:02 forged=00:00:00:00:00:03"
+  },
+  {
+    "timestamp": "07:57:01",
+    "attack_type": "ARP POISONING",
+    "method": "ML MODEL (CNN+LSTM)",
+    "how": "CNN+LSTM score >=0.5 on flow from ARP-conflicted host",
+    "ip": "10.0.0.100",
+    "mac": "00:00:00:00:00:03",
+    "detail": "score=0.5046 | score=0.5046 | ARP conflict on 10.0.0.1 known=00:00:00:00:00:01 forged=00:00:00:00:00:03"
+  },
+  {
+    "timestamp": "07:57:01",
+    "attack_type": "ARP POISONING",
+    "method": "ML MODEL (CNN+LSTM)",
+    "how": "CNN+LSTM score >=0.5 on flow from ARP-conflicted host",
+    "ip": "10.0.0.1",
+    "mac": "00:00:00:00:00:03",
+    "detail": "score=0.5029 | score=0.5029 | ARP conflict on 10.0.0.1 known=00:00:00:00:00:01 forged=00:00:00:00:00:03"
+  },
+  {
+    "timestamp": "07:57:57",
+    "attack_type": "ARP POISONING",
+    "method": "ML MODEL (CNN+LSTM)",
+    "how": "CNN+LSTM score >=0.5 on flow from ARP-conflicted host",
+    "ip": "10.0.0.11",
+    "mac": "00:00:00:00:00:11",
+    "detail": "score=0.5543 | score=0.5543 | ARP conflict on 10.0.0.2 known=00:00:00:00:00:02 forged=00:00:00:00:00:03"
+  },
+  {
+    "timestamp": "07:59:44",
+    "attack_type": "SESSION HIJACKING",
+    "method": "RULE-BASED FALLBACK",
+    "how": "RST ratio>15% + ACK count>5 after 20+ pkts; ML below threshold",
+    "ip": "10.0.0.12",
+    "mac": "00:00:00:00:00:12",
+    "detail": "RST ratio=0.50 ACKs=10 pkts=20 ML score=0.4056 (<0.5)"
+  },
+  {
+    "timestamp": "13:02:54",
+    "attack_type": "ML ANOMALY",
+    "method": "ML MODEL (CNN+LSTM)",
+    "how": "ML MODEL (CNN+LSTM) triggered",
+    "ip": "10.0.0.1",
+    "mac": "00:00:00:00:00:02",
+    "detail": "score=0.5111 | flow statistics deviate from baseline"
+  },
+  {
+    "timestamp": "13:03:51",
+    "attack_type": "ARP POISONING",
+    "method": "ML MODEL (CNN+LSTM)",
+    "how": "CNN+LSTM score >=0.5 on flow from ARP-conflicted host",
+    "ip": "10.0.0.100",
+    "mac": "00:00:00:00:00:03",
+    "detail": "score=0.5679 | score=0.5679 | ARP conflict on 10.0.0.2 known=00:00:00:00:00:02 forged=00:00:00:00:00:03"
+  },
+  {
+    "timestamp": "13:04:20",
+    "attack_type": "SESSION HIJACKING",
+    "method": "RULE-BASED FALLBACK",
+    "how": "RST ratio>15% + ACK count>5 after 20+ pkts; ML below threshold",
+    "ip": "10.0.0.12",
+    "mac": "00:00:00:00:00:12",
+    "detail": "RST ratio=0.50 ACKs=10 pkts=20 ML score=0.4238 (<0.5)"
   }
 ]
