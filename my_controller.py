@@ -72,6 +72,12 @@ SSL_DOWNGRADE_WINDOW_S   = 90    # seconds after 443 traffic to still flag port-
 TLS_KILL_RST_RATIO       = 0.40  # RST ratio threshold on a dying TLS flow
 TLS_KILL_MAX_PKTS        = 10    # a TLS flow with < this many packets + high RST = killed handshake
 
+# When the rule-based ARP detector independently confirms a conflict, we treat
+# that as strong evidence of MITM and fuse it with the ML model output using a
+# noisy-OR:  fused = 1 - (1 - p_ml)(1 - p_arp).  Legitimate ARP conflicts are
+# vanishingly rare on a managed SDN, so ARP_RULE_PRIOR is high.
+ARP_RULE_PRIOR = 0.90
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 class FlowTracker:
@@ -669,20 +675,25 @@ class MITMController(app_manager.RyuApp):
                 conflict_ip = flow.dst_ip
 
             if conflict_ip:
-                known, forged = self.arp_conflicts[conflict_ip]
-                attack_type   = "ARP POISONING"
-                sub_detail    = (f"score={score:.4f} | ARP conflict on "
-                                 f"{conflict_ip} known={known} forged={forged}")
-                suspect        = self.arp_suspects.pop(conflict_ip, None)
-                alert_ip       = suspect['attacker_ip'] if suspect else flow.src_ip
-                alert_mac      = suspect['mac']         if suspect else src_mac
+                known, forged   = self.arp_conflicts[conflict_ip]
+                # Fuse ML probability with ARP-rule confidence (noisy-OR).
+                fused           = 1.0 - (1.0 - score) * (1.0 - ARP_RULE_PRIOR)
+                attack_type     = "ARP POISONING"
+                sub_detail      = (f"ARP conflict on {conflict_ip} "
+                                   f"known={known} forged={forged} | "
+                                   f"raw ML={score:.4f}, fused={fused:.4f}")
+                display_score   = fused
+                suspect         = self.arp_suspects.pop(conflict_ip, None)
+                alert_ip        = suspect['attacker_ip'] if suspect else flow.src_ip
+                alert_mac       = suspect['mac']         if suspect else src_mac
             else:
-                alert_ip  = flow.src_ip
-                alert_mac = src_mac
+                alert_ip      = flow.src_ip
+                alert_mac     = src_mac
+                display_score = score
 
-            detail = f"score={score:.4f} | {sub_detail}"
+            detail = f"score={display_score:.4f} | {sub_detail}"
             print(Fore.RED + Style.BRIGHT + f"[{ts}] [ML!!] {attack_type} "
-                  f"score={score:.4f} on {flow.src_ip}→{flow.dst_ip}", flush=True)
+                  f"score={display_score:.4f} on {flow.src_ip}→{flow.dst_ip}", flush=True)
             self._trigger_alert(attack_type, alert_ip, alert_mac, dp,
                                 "ML MODEL (CNN+LSTM)", detail)
         else:
@@ -843,10 +854,12 @@ class MITMController(app_manager.RyuApp):
                     best_score, best_flow = score, flow
 
             if best_flow is not None and best_score >= ML_THRESHOLD:
-                detail = (f"score={best_score:.4f} | ARP conflict: {conflict_ip} "
+                fused = 1.0 - (1.0 - best_score) * (1.0 - ARP_RULE_PRIOR)
+                detail = (f"score={fused:.4f} | ARP conflict: {conflict_ip} "
                           f"known={s['known']} forged={s['forged']} | "
                           f"flow {best_flow.src_ip}→{best_flow.dst_ip} "
-                          f"pkts={best_flow.total_packets}")
+                          f"pkts={best_flow.total_packets} | "
+                          f"raw ML={best_score:.4f}, fused with ARP rule")
                 self._trigger_alert("ARP POISONING", s['attacker_ip'], s['mac'],
                                     s['dp'], "ML MODEL (CNN+LSTM)", detail)
 

@@ -134,20 +134,24 @@ def _ovs_get(field, target='s1'):
 
 def wait_for_controller(timeout=15):
     _info(f'Waiting for switch → Ryu connection (up to {timeout}s) ...')
-    steps = timeout * 4          # poll every 0.25s
+    steps = timeout * 10         # poll every 0.1s
     for i in range(steps):
         try:
             if 'true' in _ovs_get('is_connected'):
-                elapsed = i * 0.25
+                elapsed = i * 0.1
                 _ok(f'Switch s1 connected to Ryu  ({elapsed:.1f}s)')
                 return True
         except Exception:
             pass
-        # Re-kick reconnect every 2 seconds if still not connected
-        if i > 0 and i % 8 == 0:
-            subprocess.run(['ovs-appctl', '-t', 'ovs-vswitchd', 'reconnect'],
-                           capture_output=True)
-        time.sleep(0.25)
+        # Re-kick aggressively in the first 2s, then every 1s
+        if i > 0:
+            if i < 20 and i % 3 == 0:        # every 0.3s for first 2s
+                subprocess.run(['ovs-appctl', '-t', 'ovs-vswitchd', 'reconnect'],
+                               capture_output=True)
+            elif i % 10 == 0:                # then every 1s
+                subprocess.run(['ovs-appctl', '-t', 'ovs-vswitchd', 'reconnect'],
+                               capture_output=True)
+        time.sleep(0.1)
     _fail('Switch did not connect within timeout')
     return False
 
@@ -475,12 +479,23 @@ def run_demo():
     _info('Building Mininet topology ...')
     net = create_topology()
     net.start()
-    # Fast OVS connection: low backoff + short probe + force immediate reconnect
-    subprocess.run(['ovs-vsctl', 'set', 'controller', 's1',
+    # Fast OVS connection: low backoff, short probe, secure fail-mode, force
+    # a fresh connection attempt immediately (no waiting on OVS backoff timer).
+    subprocess.run(['ovs-vsctl', '--no-wait',
+                    'set-fail-mode', 's1', 'secure'],
+                   capture_output=True)
+    subprocess.run(['ovs-vsctl', '--no-wait',
+                    'set', 'controller', 's1',
                     'max_backoff=1000',
                     'inactivity_probe=5000'],
                    capture_output=True)
-    time.sleep(0.3)
+    # Drop+re-add the controller URL: this forces ovs-vswitchd to abandon any
+    # in-progress backoff timer and dial Ryu immediately.
+    subprocess.run(['ovs-vsctl', '--no-wait', 'del-controller', 's1'],
+                   capture_output=True)
+    subprocess.run(['ovs-vsctl', '--no-wait',
+                    'set-controller', 's1', 'tcp:127.0.0.1:6633'],
+                   capture_output=True)
     subprocess.run(['ovs-appctl', '-t', 'ovs-vswitchd', 'reconnect'],
                    capture_output=True)
     _ok('OVS reconnect triggered')
