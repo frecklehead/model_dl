@@ -124,5 +124,77 @@
     "ip": "10.0.0.12",
     "mac": "00:00:00:00:00:12",
     "detail": "RST ratio=0.50 ACKs=10 pkts=20 ML score=0.4238 (<0.5)"
+  },
+  {
+    "timestamp": "15:20:29",
+    "attack_type": "SESSION HIJACKING",
+    "method": "RULE-BASED (RST spoof)",
+    "how": "RST src_ip\u2192MAC does not match ARP table \u2014 packet is injected",
+    "ip": "10.0.0.1",
+    "mac": "00:00:00:00:00:03",
+    "detail": "RST from 10.0.0.1 arrived with MAC 00:00:00:00:00:03, but ARP table shows 10.0.0.1 \u2192 00:00:00:00:00:01. RST is injected (session hijacking). Target: 10.0.0.2:8080"
+  },
+  {
+    "timestamp": "15:20:57",
+    "attack_type": "ARP POISONING",
+    "method": "ML MODEL (CNN+LSTM)",
+    "how": "CNN+LSTM score >=0.5 on flow from ARP-conflicted host",
+    "ip": "10.0.0.100",
+    "mac": "00:00:00:00:00:03",
+    "detail": "score=0.9874 | ARP conflict: 10.0.0.1 known=00:00:00:00:00:01 forged=00:00:00:00:00:03 | flow 10.0.0.1\u219210.0.0.2 pkts=13 | raw ML=0.8739, fused with ARP rule"
+  },
+  {
+    "timestamp": "15:21:21",
+    "attack_type": "ARP POISONING",
+    "method": "ML MODEL (CNN+LSTM)",
+    "how": "CNN+LSTM score >=0.5 on flow from ARP-conflicted host",
+    "ip": "10.0.0.11",
+    "mac": "00:00:00:00:00:11",
+    "detail": "score=0.9540 | ARP conflict on 10.0.0.2 known=00:00:00:00:00:02 forged=00:00:00:00:00:03 | raw ML=0.5402, fused=0.9540"
+  },
+  {
+    "timestamp": "15:21:51",
+    "attack_type": "SESSION HIJACKING",
+    "method": "RULE-BASED FALLBACK",
+    "how": "RST ratio>15% + ACK count>5 after 20+ pkts; ML below threshold",
+    "ip": "10.0.0.12",
+    "mac": "00:00:00:00:00:12",
+    "detail": "RST ratio=0.50 ACKs=10 pkts=20 ML score=0.4241 (<0.5)"
+  },
+  {
+    "timestamp": "15:36:20",
+    "attack_type": "ARP POISONING",
+    "method": "ML MODEL (CNN+LSTM)",
+    "how": "CNN+LSTM score >=0.5 on flow from ARP-conflicted host",
+    "ip": "10.0.0.100",
+    "mac": "00:00:00:00:00:03",
+    "detail": "score=0.9664 | ARP conflict on 10.0.0.2 known=00:00:00:00:00:02 forged=00:00:00:00:00:03 | raw ML=0.6636, fused=0.9664"
+  },
+  {
+    "timestamp": "15:37:07",
+    "attack_type": "ARP POISONING",
+    "method": "ML MODEL (CNN+LSTM)",
+    "how": "CNN+LSTM score >=0.5 on flow from ARP-conflicted host",
+    "ip": "10.0.0.1",
+    "mac": "00:00:00:00:00:01",
+    "detail": "score=0.9511 | ARP conflict on 10.0.0.2 known=00:00:00:00:00:02 forged=00:00:00:00:00:03 | raw ML=0.5114, fused=0.9511"
+  },
+  {
+    "timestamp": "15:37:16",
+    "attack_type": "ARP POISONING",
+    "method": "ML MODEL (CNN+LSTM)",
+    "how": "CNN+LSTM score >=0.5 on flow from ARP-conflicted host",
+    "ip": "10.0.0.11",
+    "mac": "00:00:00:00:00:11",
+    "detail": "score=0.9561 | ARP conflict on 10.0.0.2 known=00:00:00:00:00:02 forged=00:00:00:00:00:03 | raw ML=0.5615, fused=0.9561"
+  },
+  {
+    "timestamp": "15:37:46",
+    "attack_type": "SESSION HIJACKING",
+    "method": "RULE-BASED FALLBACK",
+    "how": "RST ratio>15% + ACK count>5 after 20+ pkts; ML below threshold",
+    "ip": "10.0.0.12",
+    "mac": "00:00:00:00:00:12",
+    "detail": "RST ratio=0.50 ACKs=10 pkts=20 ML score=0.4237 (<0.5)"
   }
 ]

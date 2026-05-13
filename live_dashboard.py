@@ -42,7 +42,7 @@ import streamlit as st
 # PAGE CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="MITM · Detection Console",
+    page_title="MITM Watch — live dashboard",
     page_icon="🛡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -873,9 +873,9 @@ def section_label(text):
 
 # Attack description lookup (unchanged logic)
 _ATTACK_DESC = {
-    "ARP POISONING":    "Forged ARP replies redirected traffic through an attacker-controlled host.",
-    "SSL STRIPPING":    "TLS traffic was downgraded or suspicious HTTPS behavior was observed.",
-    "SESSION HIJACKING": "RST or ACK behavior matched a session-takeover pattern.",
+    "ARP POISONING":    "Someone forged ARP replies and tried to reroute traffic through their own machine.",
+    "SSL STRIPPING":    "HTTPS traffic got downgraded, or behaved oddly around TLS.",
+    "SESSION HIJACKING": "RST/ACK pattern looked like someone trying to take over a session.",
 }
 
 
@@ -965,7 +965,7 @@ def _chart_base(fig, t, title="", h=340, margin=None, showlegend=True):
 def chart_attack_frequency(df, t, colors):
     fig = go.Figure()
     if df.empty or df["_parsed_time"].isna().all():
-        return _chart_base(fig, t, "Attack frequency over time", 320)
+        return _chart_base(fig, t, "Attacks over time", 320)
 
     timed = df.dropna(subset=["_parsed_time"]).copy().sort_values("_parsed_time")
     timed["minute"] = timed["_parsed_time"].dt.floor("min")
@@ -994,15 +994,15 @@ def chart_attack_frequency(df, t, colors):
         ))
 
     fig.update_layout(barmode="stack")
-    fig.update_xaxes(title_text="Time (UTC)")
-    fig.update_yaxes(title_text="Detections")
-    return _chart_base(fig, t, "Attack frequency over time", 320)
+    fig.update_xaxes(title_text="Time")
+    fig.update_yaxes(title_text="Alerts")
+    return _chart_base(fig, t, "Attacks over time", 320)
 
 
 def chart_attack_rate(df, t):
     fig = go.Figure()
     if df.empty or df["_parsed_time"].isna().all():
-        return _chart_base(fig, t, "Attacks per minute", 280, showlegend=False)
+        return _chart_base(fig, t, "How busy each minute is", 280, showlegend=False)
 
     timed = df.dropna(subset=["_parsed_time"]).copy().sort_values("_parsed_time")
     pm = timed.groupby(timed["_parsed_time"].dt.floor("min")).size().reset_index(name="attacks")
@@ -1019,9 +1019,9 @@ def chart_attack_rate(df, t):
         marker=dict(size=6, color=t["accent"]),
         hovertemplate="%{x|%H:%M} · %{y:.1f} /min<extra></extra>",
     ))
-    fig.update_xaxes(title_text="Time (UTC)")
-    fig.update_yaxes(title_text="Attacks / min")
-    return _chart_base(fig, t, "Attacks per minute", 280, showlegend=False)
+    fig.update_xaxes(title_text="Time")
+    fig.update_yaxes(title_text="Alerts / min")
+    return _chart_base(fig, t, "How busy each minute is", 280, showlegend=False)
 
 
 def chart_score_rolling(df_flows, df_alerts, t):
@@ -1038,7 +1038,7 @@ def chart_score_rolling(df_flows, df_alerts, t):
             scores.append({"i": start + i + 1, "s": s, "src": "alerts"})
 
     if not scores:
-        return _chart_base(fig, t, "ML score rolling average", 280, showlegend=False)
+        return _chart_base(fig, t, "Model scores, smoothed out", 280, showlegend=False)
 
     sdf = pd.DataFrame(scores)
     sdf["roll"] = sdf["s"].rolling(5, min_periods=1).mean()
@@ -1061,9 +1061,9 @@ def chart_score_rolling(df_flows, df_alerts, t):
         annotation_text="threshold 0.5",
         annotation_font=dict(color=t["text_3"], size=10),
     )
-    fig.update_xaxes(title_text="Observation")
-    fig.update_yaxes(title_text="ML Score", range=[0, 1])
-    return _chart_base(fig, t, "ML score rolling average", 280)
+    fig.update_xaxes(title_text="Sample #")
+    fig.update_yaxes(title_text="Model score", range=[0, 1])
+    return _chart_base(fig, t, "Model scores, smoothed out", 280)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1111,9 +1111,9 @@ with st.sidebar:
     <div class="sb-brand">
         <div class="sb-brand-row">
             <div class="sb-icon">🛡</div>
-            <div class="sb-name">MITM Monitor</div>
+            <div class="sb-name">MITM Watch</div>
         </div>
-        <div class="sb-caption">SDN telemetry · CNN+LSTM · rule fallbacks</div>
+        <div class="sb-caption">Watching the SDN for anything that smells like a man-in-the-middle.</div>
     </div>''', unsafe_allow_html=True)
 
     # ── Refresh ────────────────────────────────────────────────────────────────
@@ -1196,39 +1196,39 @@ with st.sidebar:
         )
 
     # ── Detection methods info ─────────────────────────────────────────────────
-    st.markdown('<div class="sb-group-label">Detection</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sb-group-label">How it spots things</div>', unsafe_allow_html=True)
     st.markdown(f'''
     <div class="method-list">
         <div class="method-row">
             <div class="method-pip" style="background:{t["accent"]};"></div>
             <div class="method-text">
                 <span class="method-tag">CNN+LSTM</span>
-                Scores each flow at threshold 0.5
+                Reads every flow and flags it if the score crosses 0.5.
             </div>
         </div>
         <div class="method-row">
             <div class="method-pip" style="background:{t["amber"]};"></div>
             <div class="method-text">
-                <span class="method-tag">Rules</span>
-                ARP conflict · SSL downgrade · RST spoof
+                <span class="method-tag">Old-school rules</span>
+                ARP table mismatches, SSL downgrades, spoofed RSTs.
             </div>
         </div>
     </div>''', unsafe_allow_html=True)
 
     # ── Run commands ───────────────────────────────────────────────────────────
-    st.markdown('<div class="sb-group-label">Run</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sb-group-label">To start things up</div>', unsafe_allow_html=True)
     st.code("ryu-manager my_controller.py\\nsudo python3 run_demo.py\\nstreamlit run live_dashboard.py", language="bash")
 
     # ── Clear log ──────────────────────────────────────────────────────────────
-    st.markdown('<div class="sb-group-label">Danger zone</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sb-group-label">Reset</div>', unsafe_allow_html=True)
     st.markdown('<div class="sb-danger">', unsafe_allow_html=True)
-    if st.button("⚠ Clear alert log", use_container_width=True):
+    if st.button("⚠ Wipe the alert log", use_container_width=True):
         try:
             open(ALERTS_FILE, "w").write("[]")
             open(STATUS_FILE, "w").write("{}")
-            st.success("Logs cleared")
+            st.success("Cleared — starting fresh.")
         except Exception:
-            st.error("Could not clear logs")
+            st.error("Couldn't clear the logs, sorry.")
     st.markdown('</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1266,16 +1266,16 @@ if not filtered_flows_df.empty:
 # ──────────────────────────────────────────────────────────────────────────────
 status_cls  = "live" if is_live else "offline"
 status_text = (
-    f"updated {(status or {}).get('timestamp', 'unknown')}"
-    if is_live else "controller offline"
+    f"last update · {(status or {}).get('timestamp', 'unknown')}"
+    if is_live else "controller isn't talking yet"
 )
 
 st.markdown(f"""
 <div class="dash-header">
     <div class="dash-shield">🛡</div>
     <div>
-        <div class="dash-title">Attack Detection Console</div>
-        <div class="dash-sub">live SDN flow monitoring · man-in-the-middle defense</div>
+        <div class="dash-title">What's happening on the network</div>
+        <div class="dash-sub">live SDN flows — watching for man-in-the-middle activity</div>
     </div>
     <div class="dash-status">
         <span class="dot {status_cls}"></span>
@@ -1308,11 +1308,11 @@ else:
 
     st.markdown(f"""
     <div class="kpi-grid">
-        {kpi_card("Active flows",  f"{(status or {}).get('active_flows', 0):,}", f"{malicious_flows} above threshold", t["accent"])}
-        {kpi_card("Switches",      f"{(status or {}).get('switches', 0):,}",     "Controller datapaths",               t["cyan"])}
-        {kpi_card("ARP entries",   f"{(status or {}).get('arp_entries', 0):,}",  "Known IP→MAC bindings",              t["emerald"])}
-        {kpi_card("Total attacks", f"{total_attacks:,}",                         "All filter-scoped detections",       t["crimson"])}
-        {kpi_card("Blocked IPs",   f"{len(blocked):,}",                          "Mitigated hosts",                    t["amber"])}
+        {kpi_card("Live flows",      f"{(status or {}).get('active_flows', 0):,}", f"{malicious_flows} look fishy",        t["accent"])}
+        {kpi_card("Switches up",     f"{(status or {}).get('switches', 0):,}",     "talking to the controller",            t["cyan"])}
+        {kpi_card("Hosts I know",    f"{(status or {}).get('arp_entries', 0):,}",  "IP → MAC pairs seen so far",           t["emerald"])}
+        {kpi_card("Attacks caught",  f"{total_attacks:,}",                         "matching the filters on the left",     t["crimson"])}
+        {kpi_card("Hosts I blocked", f"{len(blocked):,}",                          "cut off from the network",             t["amber"])}
     </div>""", unsafe_allow_html=True)
 
 
@@ -1320,7 +1320,7 @@ else:
 # TABS
 # ──────────────────────────────────────────────────────────────────────────────
 tab_live, tab_alerts, tab_flows, tab_analysis = st.tabs(
-    ["Live Detection", "Alert Log", "Network Flows", "Attack Analysis"]
+    ["Live view", "Alert log", "Traffic", "Closer look"]
 )
 
 
@@ -1328,8 +1328,8 @@ tab_live, tab_alerts, tab_flows, tab_analysis = st.tabs(
 with tab_live:
     if not is_live and not all_detections:
         st.markdown(state_card(
-            "Waiting for controller telemetry",
-            "Start ryu-manager and run_demo.py to populate live detections.",
+            "Nothing yet — waiting on the controller",
+            "Once ryu-manager and run_demo.py are running, activity will show up here.",
             warn=True,
         ), unsafe_allow_html=True)
     else:
@@ -1350,7 +1350,7 @@ with tab_live:
             bg     = BACKGROUNDS[atype] if hot else t["surface"]
             border = f"color-mix(in srgb,{color} 30%,{t['border_soft']})" if hot else t["border_soft"]
             cnt_cls = "atk-count hot" if hot else "atk-count"
-            status_copy = "Detections require review" if hot else "No current detections"
+            status_copy = "needs a closer look" if hot else "nothing to worry about"
             cards_html += f"""
             <div class="atk {'hot' if hot else ''}"
                  style="--atk-color:{color}; --atk-bg:{bg}; --atk-border:{border};">
@@ -1364,22 +1364,39 @@ with tab_live:
 
         st.markdown(f'<div class="attack-row">{cards_html}</div>', unsafe_allow_html=True)
 
-        # Recent detections
-        recent = filtered_detections[-10:]
-        if recent:
-            st.markdown(section_label("Recent detections"), unsafe_allow_html=True)
-            for rec in reversed(recent):
+        # Recent detections — newest first, then make sure every attack type
+        # present in the log gets at least one card so SSL/SH don't get pushed
+        # out of view by a long run of ARP events.
+        display_list      = list(reversed(filtered_detections[-10:]))
+        shown_ids         = {id(r) for r in display_list}
+        seen_types        = {attack_key(r) for r in display_list}
+        for atype in selected_types:
+            if atype in seen_types:
+                continue
+            older = next(
+                (r for r in reversed(filtered_detections)
+                 if attack_key(r) == atype and id(r) not in shown_ids),
+                None,
+            )
+            if older is not None:
+                display_list.append(older)
+                shown_ids.add(id(older))
+                seen_types.add(atype)
+
+        if display_list:
+            st.markdown(section_label("Latest activity"), unsafe_allow_html=True)
+            for rec in display_list:
                 st.markdown(alert_card_html(rec, t, COLORS), unsafe_allow_html=True)
         else:
             st.markdown(state_card(
-                "No detections match current filters",
-                "Clear filters to inspect the complete event stream.",
+                "Nothing matches the filters right now",
+                "Clear the filters on the left to see everything that came through.",
             ), unsafe_allow_html=True)
 
         # Blocked IPs
         blocked = (status or {}).get("blocked_ips", [])
         if blocked:
-            st.markdown(section_label("Blocked hosts"), unsafe_allow_html=True)
+            st.markdown(section_label("Hosts I've cut off"), unsafe_allow_html=True)
             badges = "".join(
                 f'<span class="blocked-badge"><span class="blocked-dot"></span>{esc(ip)}</span>'
                 for ip in blocked
@@ -1390,12 +1407,12 @@ with tab_live:
 # ── TAB: Alert Log ────────────────────────────────────────────────────────────
 with tab_alerts:
     if filtered_alerts_df.empty:
-        st.info("No alerts match the current filters.")
+        st.info("No alerts matching your filters yet.")
     else:
-        st.markdown(section_label("Full alert history"), unsafe_allow_html=True)
+        st.markdown(section_label("Every alert so far"), unsafe_allow_html=True)
         q = st.text_input(
             "Search alerts",
-            placeholder="IP · method · MAC · attack type · detail",
+            placeholder="search by IP, MAC, attack type, anything really…",
             key="alert_search",
         )
         tdf = filter_by_search(filtered_alerts_df, q)
@@ -1411,14 +1428,14 @@ with tab_alerts:
 # ── TAB: Network Flows ────────────────────────────────────────────────────────
 with tab_flows:
     if filtered_flows_df.empty:
-        st.info("No active flows match the current filters.")
+        st.info("No traffic matches your filters at the moment.")
     else:
-        st.markdown(section_label("Active network flows"), unsafe_allow_html=True)
-        st.caption("ML score ≥ 0.5 or controller MITM flag indicates malicious activity.")
+        st.markdown(section_label("Live traffic"), unsafe_allow_html=True)
+        st.caption("Anything scoring 0.5 or higher, or already flagged by the controller, is treated as malicious.")
 
         qf = st.text_input(
             "Search flows",
-            placeholder="source IP · destination IP · protocol · port · score",
+            placeholder="search by source, destination, port, score…",
             key="flow_search",
         )
         dfl = filter_by_search(filtered_flows_df, qf)
@@ -1456,7 +1473,7 @@ with tab_flows:
             fig_hist.update_layout(barmode="overlay")
             fig_hist.update_xaxes(title_text="Score", range=[0, 1])
             fig_hist.update_yaxes(title_text="Count")
-            st.plotly_chart(_chart_base(fig_hist, t, "Flow ML score distribution", 300), use_container_width=True)
+            st.plotly_chart(_chart_base(fig_hist, t, "How flows scored", 300), use_container_width=True)
 
         with col_t:
             if {"src_ip","s2d_bytes"}.issubset(dfl.columns):
@@ -1476,7 +1493,7 @@ with tab_flows:
                 fig_tr.update_xaxes(title_text="Bytes out")
                 fig_tr.update_yaxes(title_text="", autorange="reversed")
                 st.plotly_chart(
-                    _chart_base(fig_tr, t, "Traffic by source IP", 300,
+                    _chart_base(fig_tr, t, "Who's sending the most traffic", 300,
                                 margin=dict(t=48, b=40, l=110, r=24),
                                 showlegend=False),
                     use_container_width=True,
@@ -1486,7 +1503,7 @@ with tab_flows:
 # ── TAB: Attack Analysis ──────────────────────────────────────────────────────
 with tab_analysis:
     if filtered_alerts_df.empty and filtered_flows_df.empty:
-        st.info("No attack data available for the current filters.")
+        st.info("Nothing to plot yet — once attacks start coming in, charts will show up here.")
     else:
         col_a, col_b = st.columns(2)
         with col_a:
@@ -1500,7 +1517,7 @@ with tab_analysis:
                     textfont=dict(size=11, color=t["text_2"]),
                     hovertemplate="<b>%{label}</b> · %{value} events<extra></extra>",
                 ))
-                st.plotly_chart(_chart_base(fig_pie, t, "Attacks by type", 320, showlegend=False), use_container_width=True)
+                st.plotly_chart(_chart_base(fig_pie, t, "What kind of attacks", 320, showlegend=False), use_container_width=True)
 
         with col_b:
             if not filtered_alerts_df.empty and "Method" in filtered_alerts_df.columns:
@@ -1516,7 +1533,7 @@ with tab_analysis:
                 fig_m.update_xaxes(title_text="Count")
                 fig_m.update_yaxes(autorange="reversed")
                 st.plotly_chart(
-                    _chart_base(fig_m, t, "Detections by method", 320,
+                    _chart_base(fig_m, t, "How they got caught", 320,
                                 margin=dict(t=48, b=40, l=160, r=24),
                                 showlegend=False),
                     use_container_width=True,
@@ -1533,7 +1550,7 @@ with tab_analysis:
 
         # Flagged IP frequency
         if not filtered_alerts_df.empty and "IP" in filtered_alerts_df.columns:
-            st.markdown(section_label("Flagged IPs"), unsafe_allow_html=True)
+            st.markdown(section_label("Who keeps showing up"), unsafe_allow_html=True)
             ic = filtered_alerts_df["IP"].replace("", np.nan).dropna().value_counts()
             if not ic.empty:
                 fig_ip = go.Figure(go.Bar(
@@ -1545,7 +1562,7 @@ with tab_analysis:
                 ))
                 fig_ip.update_yaxes(title_text="Flags")
                 fig_ip.update_xaxes(title_text="IP address")
-                st.plotly_chart(_chart_base(fig_ip, t, "Flagged IP frequency", 280, showlegend=False), use_container_width=True)
+                st.plotly_chart(_chart_base(fig_ip, t, "Repeat offenders", 280, showlegend=False), use_container_width=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1553,8 +1570,8 @@ with tab_analysis:
 # ──────────────────────────────────────────────────────────────────────────────
 st.markdown(f"""
 <div class="dash-footer">
-    <span>MITM Detection System · CNN+LSTM · SDN Controller</span>
-    <span>live monitoring dashboard</span>
+    <span>Built for a minor project — CNN+LSTM behind the scenes, plus a few sanity-check rules.</span>
+    <span>refreshing every {refresh}s</span>
 </div>
 """, unsafe_allow_html=True)
 
