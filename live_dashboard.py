@@ -211,17 +211,148 @@ def build_css(t: dict) -> str:
   }}
   hr {{ border-color: var(--border-soft) !important; margin: 16px 0 !important; }}
 
-  /* ── Sidebar ────────────────────────────────────────────── */
-  section[data-testid="stSidebar"] {{
-    background: var(--surface) !important;
-    border-right: 1px solid var(--border-soft) !important;
-    width: 248px !important;
-  }}
-  section[data-testid="stSidebar"] * {{ color: var(--text-2); font-size: 13px; }}
-  section[data-testid="stSidebar"] h1,
-  section[data-testid="stSidebar"] h2,
-  section[data-testid="stSidebar"] h3,
-  section[data-testid="stSidebar"] strong {{ color: var(--text) !important; }}
+    /* ── Sidebar shell ──────────────────────────────────────── */
+    section[data-testid="stSidebar"] {{
+        background: var(--surface) !important;
+        border-right: 1px solid var(--border-soft) !important;
+        width: 264px !important;
+    }}
+    section[data-testid="stSidebar"] * {{ color: var(--text-2); font-size: 13px; }}
+    section[data-testid="stSidebar"] h1,
+    section[data-testid="stSidebar"] h2,
+    section[data-testid="stSidebar"] h3,
+    section[data-testid="stSidebar"] strong {{ color: var(--text) !important; }}
+
+    /* ── Sidebar branding ────────────────────────────────────── */
+    .sb-brand {{
+        padding: 20px 18px 16px;
+        border-bottom: 1px solid var(--border-soft);
+    }}
+    .sb-brand-row {{
+        display: flex; align-items: center; gap: 10px; margin-bottom: 4px;
+    }}
+    .sb-icon {{
+        width: 28px; height: 28px; display: grid; place-items: center;
+        background: {t["grad_accent"]}; border: 1px solid var(--border);
+        border-radius: var(--r); font-size: 14px; flex-shrink: 0;
+    }}
+    .sb-name {{
+        font-size: 13px; font-weight: 700; color: var(--text); letter-spacing: -.01em;
+    }}
+    .sb-caption {{
+        font-size: 11px; color: var(--text-3);
+        font-family: 'IBM Plex Mono', monospace; line-height: 1.5;
+    }}
+
+    /* ── Sidebar group label ─────────────────────────────────── */
+    .sb-group-label {{
+        font-size: 10px; font-weight: 700; letter-spacing: .10em;
+        text-transform: uppercase; color: var(--text-3);
+        margin: 16px 0 10px; display: flex; align-items: center; gap: 6px;
+    }}
+    .sb-group-label::after {{
+        content: ""; flex: 1; height: 1px; background: var(--border-soft);
+    }}
+    .sb-divider {{
+        height: 1px; background: var(--border-soft); margin: 12px 0;
+    }}
+
+    /* ── Attack type chip rows ───────────────────────────────── */
+    .atk-chips {{ display: flex; flex-direction: column; gap: 5px; }}
+    .atk-chip {{
+        display: flex; align-items: center; gap: 8px;
+        padding: 8px 10px;
+        border: 1px solid var(--border-soft); border-radius: var(--r);
+        background: var(--surface-2);
+        transition: border-color .15s, background .15s;
+    }}
+    .atk-chip.active {{
+        background: var(--chip-bg); border-color: var(--chip-border);
+    }}
+    .atk-chip-dot {{
+        width: 7px; height: 7px; border-radius: 50%;
+        background: var(--chip-color); flex-shrink: 0;
+    }}
+    .atk-chip.inactive .atk-chip-dot {{ opacity: .25; }}
+    .atk-chip-label {{
+        font-size: 11px; font-weight: 600; letter-spacing: .05em;
+        text-transform: uppercase; color: var(--text-2); flex: 1;
+    }}
+    .atk-chip.inactive .atk-chip-label {{ color: var(--text-3); }}
+    .atk-chip-count {{
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 12px; font-weight: 600;
+        color: var(--chip-color);
+    }}
+    .atk-chip.inactive .atk-chip-count {{ color: var(--text-3); }}
+    .atk-chip-check {{ font-size: 10px; color: var(--chip-color); opacity: 0; transition: opacity .15s; }}
+    .atk-chip.active .atk-chip-check {{ opacity: 1; }}
+
+    /* ── Refresh row ─────────────────────────────────────────── */
+    .refresh-row {{
+        display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;
+    }}
+    .refresh-label {{
+        font-size: 11px; font-weight: 600; letter-spacing: .04em;
+        text-transform: uppercase; color: var(--text-3);
+    }}
+    .refresh-val {{
+        font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600;
+        color: var(--accent); background: {t["accent_bg"]};
+        border: 1px solid {t["border_soft"]}; border-radius: 2px; padding: 1px 6px;
+    }}
+
+    /* ── Detection method list ───────────────────────────────── */
+    .method-list {{ display: flex; flex-direction: column; gap: 5px; }}
+    .method-row {{
+        display: flex; align-items: flex-start; gap: 8px; padding: 7px 10px;
+        border: 1px solid var(--border-soft); border-radius: var(--r);
+        background: var(--surface-2);
+    }}
+    .method-pip {{
+        width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; margin-top: 5px;
+    }}
+    .method-text {{
+        font-size: 11px; color: var(--text-3);
+        font-family: 'IBM Plex Mono', monospace; line-height: 1.5;
+    }}
+    .method-tag {{
+        font-size: 10px; font-weight: 600; color: var(--text-2);
+        display: block; margin-bottom: 1px; letter-spacing: .04em;
+        text-transform: uppercase;
+    }}
+
+    /* ── Sidebar multiselect overrides ──────────────────────── */
+    section[data-testid="stSidebar"] [data-baseweb="select"] {{
+        background: var(--surface-2) !important;
+        border-color: var(--border-soft) !important;
+        border-radius: var(--r) !important;
+        font-size: 12px !important;
+    }}
+    section[data-testid="stSidebar"] [data-baseweb="select"]:focus-within {{
+        border-color: var(--accent) !important;
+    }}
+    section[data-testid="stSidebar"] [data-baseweb="tag"] {{
+        background: var(--surface-3) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 2px !important;
+        font-family: 'IBM Plex Mono', monospace !important;
+        font-size: 10px !important; color: var(--text-2) !important;
+        padding: 2px 6px !important;
+    }}
+
+    /* ── Clear log danger button ─────────────────────────────── */
+    .sb-danger button {{
+        width: 100% !important;
+        border-color: var(--border-soft) !important;
+        background: var(--surface-2) !important;
+        color: var(--crimson) !important;
+        font-size: 12px !important; font-weight: 500 !important;
+    }}
+    .sb-danger button:hover {{
+        border-color: var(--crimson) !important;
+        background: {t["crimson_bg"]} !important;
+    }}
 
   /* ── Dashboard header ───────────────────────────────────── */
   .dash-header {{
@@ -960,18 +1091,62 @@ flows_df       = pd.DataFrame((status or {}).get("flows", []))
 
 # ── Sidebar controls ──
 with st.sidebar:
-    st.markdown("---")
-    st.markdown("**MITM Monitor**")
-    st.caption("SDN controller telemetry · CNN+LSTM scoring · rule-based fallbacks")
-    st.markdown("---")
 
-    refresh = st.slider("Refresh (s)", 1, 10, 2)
+    # ── Branding ──────────────────────────────────────────────────────────────
+    st.markdown(f'''
+    <div class="sb-brand">
+        <div class="sb-brand-row">
+            <div class="sb-icon">🛡</div>
+            <div class="sb-name">MITM Monitor</div>
+        </div>
+        <div class="sb-caption">SDN telemetry · CNN+LSTM · rule fallbacks</div>
+    </div>''', unsafe_allow_html=True)
 
-    st.markdown("##### Filters")
-    selected_types = st.multiselect(
-        "Attack type", ATTACK_TYPES, default=ATTACK_TYPES,
+    # ── Refresh ────────────────────────────────────────────────────────────────
+    st.markdown('<div style="padding:0 2px">', unsafe_allow_html=True)
+    st.markdown('<div class="sb-group-label">Refresh</div>', unsafe_allow_html=True)
+    refresh = st.slider("Refresh interval", 1, 10, 2, label_visibility="collapsed")
+    st.markdown(
+        f'<div class="refresh-row"><span class="refresh-label">Interval</span><span class="refresh-val">{refresh}s</span></div>',
+        unsafe_allow_html=True,
     )
 
+    # ── Attack type filter — styled chips above native multiselect ─────────────
+    st.markdown('<div class="sb-group-label">Attack type</div>', unsafe_allow_html=True)
+
+    # Compute per-type counts for chip badges
+    _counts_preview = {}
+    if not alerts_df.empty and "Attack Type" in alerts_df.columns:
+        _counts_preview = alerts_df["Attack Type"].value_counts().to_dict()
+
+    _chip_meta = {
+        "ARP POISONING":    (t["crimson"], t["crimson_bg"], f"color-mix(in srgb,{t['crimson']} 28%,{t['border_soft']})"),
+        "SSL STRIPPING":    (t["amber"],   t["amber_bg"],   f"color-mix(in srgb,{t['amber']} 28%,{t['border_soft']})"),
+        "SESSION HIJACKING":(t["violet"],  t["violet_bg"],  f"color-mix(in srgb,{t['violet']} 28%,{t['border_soft']})"),
+    }
+    chips_html = '<div class="atk-chips">'
+    for atype in ATTACK_TYPES:
+        color, bg, border = _chip_meta[atype]
+        count = _counts_preview.get(atype, 0)
+        chips_html += f'''
+        <div class="atk-chip active"
+             style="--chip-color:{color};--chip-bg:{bg};--chip-border:{border};">
+            <div class="atk-chip-dot"></div>
+            <div class="atk-chip-label">{atype}</div>
+            <div class="atk-chip-count">{count if count else ""}</div>
+            <div class="atk-chip-check">✓</div>
+        </div>'''
+    chips_html += '</div>'
+    st.markdown(chips_html, unsafe_allow_html=True)
+
+    # Native multiselect hidden behind chips (drives actual filter logic)
+    selected_types = st.multiselect(
+        "Attack type", ATTACK_TYPES, default=ATTACK_TYPES,
+        label_visibility="collapsed",
+    )
+
+    # ── IP filter ─────────────────────────────────────────────────────────────
+    st.markdown('<div class="sb-group-label">IP address</div>', unsafe_allow_html=True)
     ip_options = sorted({
         str(ip)
         for ip in (
@@ -981,26 +1156,67 @@ with st.sidebar:
         )
         if str(ip)
     })
-    selected_ips = st.multiselect("IP address", ip_options, default=[])
+    selected_ips = st.multiselect(
+        "Filter by IP", ip_options, default=[],
+        placeholder="All IPs",
+        label_visibility="collapsed",
+    )
 
+    # ── Malicious-only toggle ──────────────────────────────────────────────────
+    st.markdown('<div class="sb-group-label">Flow view</div>', unsafe_allow_html=True)
     show_malicious_only = st.toggle("Malicious flows only", value=False)
 
-    st.markdown("---")
-    st.markdown("##### Detection methods")
-    st.caption("CNN+LSTM scores each flow at threshold 0.5.")
-    st.caption("Rules: ARP conflict · SSL downgrade · RST spoof fallbacks.")
-    st.markdown("---")
-    st.markdown("##### Run")
-    st.code("ryu-manager my_controller.py\nsudo python3 run_demo.py\nstreamlit run live_dashboard.py", language="bash")
-    st.markdown("---")
+    # Show active filter count
+    active_filters = (len(selected_types) < len(ATTACK_TYPES)) or bool(selected_ips) or show_malicious_only
+    if active_filters:
+        parts = []
+        if len(selected_types) < len(ATTACK_TYPES):
+            parts.append(f"{len(selected_types)}/{len(ATTACK_TYPES)} types")
+        if selected_ips:
+            parts.append(f"{len(selected_ips)} IPs")
+        if show_malicious_only:
+            parts.append("malicious only")
+        st.markdown(
+            f'<div style="margin-top:8px;padding:6px 10px;background:{t["accent_bg"]};border:1px solid {t["border_soft"]};border-radius:4px;font-size:11px;font-family:\'IBM Plex Mono\',monospace;color:{t["accent"]};">▸ Filtered: {" · ".join(parts)}</div>',
+            unsafe_allow_html=True,
+        )
 
-    if st.button("Clear alert log", use_container_width=True):
+    # ── Detection methods info ─────────────────────────────────────────────────
+    st.markdown('<div class="sb-group-label">Detection</div>', unsafe_allow_html=True)
+    st.markdown(f'''
+    <div class="method-list">
+        <div class="method-row">
+            <div class="method-pip" style="background:{t["accent"]};"></div>
+            <div class="method-text">
+                <span class="method-tag">CNN+LSTM</span>
+                Scores each flow at threshold 0.5
+            </div>
+        </div>
+        <div class="method-row">
+            <div class="method-pip" style="background:{t["amber"]};"></div>
+            <div class="method-text">
+                <span class="method-tag">Rules</span>
+                ARP conflict · SSL downgrade · RST spoof
+            </div>
+        </div>
+    </div>''', unsafe_allow_html=True)
+
+    # ── Run commands ───────────────────────────────────────────────────────────
+    st.markdown('<div class="sb-group-label">Run</div>', unsafe_allow_html=True)
+    st.code("ryu-manager my_controller.py\\nsudo python3 run_demo.py\\nstreamlit run live_dashboard.py", language="bash")
+
+    # ── Clear log ──────────────────────────────────────────────────────────────
+    st.markdown('<div class="sb-group-label">Danger zone</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sb-danger">', unsafe_allow_html=True)
+    if st.button("⚠ Clear alert log", use_container_width=True):
         try:
             open(ALERTS_FILE, "w").write("[]")
             open(STATUS_FILE, "w").write("{}")
             st.success("Logs cleared")
         except Exception:
             st.error("Could not clear logs")
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
