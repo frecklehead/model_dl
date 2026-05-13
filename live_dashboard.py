@@ -889,8 +889,22 @@ def alert_card_html(rec, t, colors):
     how    = rec.get("how", "") or rec.get("detail", "")
     desc   = _ATTACK_DESC.get(atype, "Detection reported by the SDN controller.")
 
+    score = extract_score(rec.get("detail", ""))
+    if np.isnan(score):
+        score_pill = ""
+    else:
+        score_color = t["crimson"] if score >= 0.5 else t["emerald"]
+        score_pill = (
+            f'<span class="pill" style="border-color:color-mix(in srgb,{score_color} 35%,{t["border_soft"]});'
+            f'background:color-mix(in srgb,{score_color} 8%,{t["surface_2"]});">'
+            f'<span class="pill-label">ML score</span>'
+            f'<span class="pill-val" style="color:{score_color};font-weight:600;">{score:.4f}</span>'
+            f'</span>'
+        )
+
     pills = (
-        f'<span class="pill"><span class="pill-label">method</span><span class="pill-val">{esc(method or "—")}</span></span>'
+        score_pill
+        + f'<span class="pill"><span class="pill-label">method</span><span class="pill-val">{esc(method or "—")}</span></span>'
         f'<span class="pill"><span class="pill-label">src</span><span class="pill-val">{esc(ip or "—")}</span></span>'
         f'<span class="pill"><span class="pill-label">mac</span><span class="pill-val">{esc(mac or "—")}</span></span>'
     )

@@ -225,7 +225,7 @@ def _attack_header(num, title, lines, host_label, alert_label):
     print(RD + BD + '╚' + '═' * (W - 2) + '╝' + RS)
 
 # ── ATTACK 1 — ARP Poisoning MITM ────────────────────────────────────────────
-def attack_arp(victim, server, attacker, device1, device2):
+def attack_arp(victim, server, attacker, device1, device2, interactive=True):
     _attack_header(
         1, 'ARP Poisoning MITM',
         [
@@ -296,10 +296,11 @@ def attack_arp(victim, server, attacker, device1, device2):
 
     _stop_attacks()
     print()
-    input(f'  {DM}Press Enter to return to menu ...{RS}')
+    if interactive:
+        input(f'  {DM}Press Enter to return to menu ...{RS}')
 
 # ── ATTACK 2 — SSL Stripping ──────────────────────────────────────────────────
-def attack_ssl(victim, server, attacker, device1, device2):
+def attack_ssl(victim, server, attacker, device1, device2, interactive=True):
     _attack_header(
         2, 'SSL Stripping',
         [
@@ -333,10 +334,11 @@ def attack_ssl(victim, server, attacker, device1, device2):
 
     _stop_attacks()
     print()
-    input(f'  {DM}Press Enter to return to menu ...{RS}')
+    if interactive:
+        input(f'  {DM}Press Enter to return to menu ...{RS}')
 
 # ── ATTACK 3 — Session Hijacking ──────────────────────────────────────────────
-def attack_session_hijack(victim, server, attacker, device1, device2):
+def attack_session_hijack(victim, server, attacker, device1, device2, interactive=True):
     _attack_header(
         3, 'Session Hijacking (RST Injection)',
         [
@@ -371,7 +373,8 @@ def attack_session_hijack(victim, server, attacker, device1, device2):
 
     _stop_attacks()
     print()
-    input(f'  {DM}Press Enter to return to menu ...{RS}')
+    if interactive:
+        input(f'  {DM}Press Enter to return to menu ...{RS}')
 
 # ── Attack registry ───────────────────────────────────────────────────────────
 ATTACKS = [
@@ -431,10 +434,14 @@ def attack_menu(net, victim, server, attacker, device1, device2):
             fn(*hosts)
 
         elif choice == 'a':
-            print(f'\n  {YL}Running all 3 attacks sequentially.{RS}')
-            for _, name, fn in ATTACKS:
-                fn(*hosts)
+            print(f'\n  {YL}Running all 3 attacks sequentially (no prompts between).{RS}')
+            for idx, (_, name, fn) in enumerate(ATTACKS, start=1):
+                fn(*hosts, interactive=False)
+                if idx < len(ATTACKS):
+                    print(f'\n  {DM}── Next attack starting in 3s ──{RS}')
+                    time.sleep(3)
             print(f'\n  {GR}{BD}All 3 attacks complete.{RS}')
+            input(f'  {DM}Press Enter to return to menu ...{RS}')
 
         elif choice == 'r':
             print()
